@@ -17,6 +17,16 @@ STOP_NEW = (BASE / "phase2_assets" / "dialogue_stop.pyfrag").read_text(encoding=
 
 
 def patched(source: str) -> str:
+    if "# AI_ROUTER_DIALOGUE_RESUME_V11" in source:
+        required = (
+            MARKER, "import dialogue_task_service as _dts",
+            "_dts.create_dialogue_task", "_dts.create_dialogue_continuation",
+            "_dts.read_dialogue_job", "_dts.request_dialogue_stop",
+            "_dts.reconcile_interrupted_dialogue_tasks",
+        )
+        if not all(item in source for item in required):
+            raise RuntimeError("Incomplete Dialogue continuation detected")
+        return source
     if MARKER in source:
         if not all(s in source for s in (
             "import dialogue_task_service as _dts", WORKER_NEW,

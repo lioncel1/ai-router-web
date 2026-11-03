@@ -329,15 +329,17 @@ def _run_dialogue_job(
     second_provider: str,
     prompt: str,
     max_messages: int,
+    resume_context: dict | None = None,
 ) -> None:
     # Keep original v0.7 routing: raw user prompt to A, then exact previous
     # model answer to the other provider. No hidden system or role injection.
-    names = {
+    names = (dict(resume_context["conversation_names"]) if resume_context else {
         first_provider: f"dialogue-{job_id[:8]}-{first_provider}",
         second_provider: f"dialogue-{job_id[:8]}-{second_provider}",
-    }
-    started: set[str] = set()
-    current = first_provider
+    })
+    started: set[str] = (set(resume_context["started_providers"]) if resume_context else set())
+    current = resume_context["next_provider"] if resume_context else first_provider
+    index_offset = resume_context["completed_messages"] if resume_context else 0
     incoming = prompt
 
     def end(status: str, error: str = "") -> None:
@@ -377,6 +379,19 @@ def _run_dialogue_job(
         provider_prompt = incoming
         action = "ask" if current in started else "new"
         try:
+            _dts.record_dialogue_dispatch_intent(
+                job_id, index=index_offset + index + 1, provider=current,
+                action=action, conversation_name=names[current], prompt=provider_prompt,
+            )
+        except Exception:
+            error = "发送检查点写入失败，模型消息未发送"
+            try:
+                _dts.fail_dialogue_task(job_id, code="dispatch_intent_failed", reason=error)
+            except Exception:
+                pass
+            end("failed", error)
+            return
+        try:
             result = run_provider(current, action, names[current], provider_prompt)
         except Exception as exc:
             error = f"{current} 调用异常：{type(exc).__name__}"
@@ -389,7 +404,7 @@ def _run_dialogue_job(
 
         try:
             recorded = _dts.record_dialogue_step(
-                job_id, index=index + 1, provider=current, action=action,
+                job_id, index=index_offset + index + 1, provider=current, action=action,
                 prompt=provider_prompt, conversation_name=names[current], result=result,
             )
         except Exception as exc:
@@ -419,7 +434,7 @@ def _run_dialogue_job(
         started.add(current)
         incoming = answer
         message = {
-            "index": index + 1, "provider": current, "answer": answer,
+            "index": index_offset + index + 1, "provider": current, "answer": answer,
             "duration_ms": result.get("duration_ms", 0),
             "conversation_name": names[current],
             "conversation_url": result.get("conversation_url", ""),
@@ -483,6 +498,98 @@ async def dialogue_start(req: DialogueRequest):
     DIALOGUE_TASKS.add(task)
     task.add_done_callback(DIALOGUE_TASKS.discard)
     return {"success": True, "job_id": job_id, "status": "queued"}
+
+
+# AI_ROUTER_DIALOGUE_RESUME_V11
+class DialogueContinueRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    additional_messages: int = Field(default=6, ge=1, le=100)
+
+    validate_prompt = field_validator("prompt")(ChatRequest.validate_prompt.__func__)
+
+
+@app.get("/api/dialogue/prepare/{job_id}")
+async def dialogue_prepare(job_id: str):
+    try:
+        preview = await asyncio.to_thread(_dts.prepare_dialogue_continuation, job_id)
+    except _dts.ResumeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {"success": True, **{
+        k: preview[k] for k in ("source_job_id", "first_provider", "second_provider",
+                             "next_provider", "last_provider", "default_prompt",
+                             "completed_messages", "next_action")}}
+
+
+@app.post("/api/dialogue/continue/{job_id}")
+async def dialogue_continue(job_id: str, req: DialogueContinueRequest):
+    try:
+        detail = await asyncio.to_thread(
+            _dts.create_dialogue_continuation, job_id, req.prompt, req.additional_messages
+        )
+    except _dts.ResumeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=503, detail="无法持久化续聊任务；未发送模型消息")
+    new_id = detail["job_id"]
+    preview = detail["preview"]
+    with DIALOGUE_JOBS_LOCK:
+        DIALOGUE_JOBS[new_id] = {
+            "status": "queued",
+            "first_provider": preview["first_provider"],
+            "second_provider": preview["second_provider"],
+            "max_messages": preview["completed_messages"] + req.additional_messages,
+            "completed_messages": preview["completed_messages"],
+            "messages": [dict(item) for item in preview["messages"]],
+            "stop_requested": False, "current_provider": "", "error": "",
+            "parent_job_id": job_id,
+            "resume_prompt_edited": req.prompt != preview["default_prompt"],
+        }
+    task = asyncio.create_task(asyncio.to_thread(
+        _run_dialogue_job, new_id, preview["first_provider"],
+        preview["second_provider"], req.prompt, req.additional_messages, preview
+    ))
+    DIALOGUE_TASKS.add(task)
+    task.add_done_callback(DIALOGUE_TASKS.discard)
+    return {"success": True, "job_id": new_id, "status": "queued", "parent_job_id": job_id}
+
+
+# AI_ROUTER_DIALOGUE_RECOVERY_V11
+import dialogue_recovery as _dialogue_recovery
+
+class DialogueRecoveryConfirmRequest(BaseModel):
+    answer_hash: str = Field(min_length=64, max_length=64)
+    confirmed: bool
+
+
+@app.get("/api/dialogue/recovery-status/{job_id}")
+async def dialogue_recovery_status(job_id: str):
+    try:
+        return await asyncio.to_thread(_dialogue_recovery.recovery_status, job_id)
+    except _dts.ResumeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=503, detail="无法查询恢复任务关联，请勿重复确认恢复")
+
+
+@app.get("/api/dialogue/recover/{job_id}")
+async def dialogue_recovery_preview(job_id: str):
+    try:
+        return await asyncio.to_thread(_dialogue_recovery.preview, job_id)
+    except _dts.ResumeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=503, detail="无法读取原网页回答；未发送任何模型消息")
+
+
+@app.post("/api/dialogue/recover/{job_id}")
+async def dialogue_recovery_confirm(job_id: str, req: DialogueRecoveryConfirmRequest):
+    try:
+        return await asyncio.to_thread(_dialogue_recovery.confirm, job_id,
+                                       req.answer_hash, req.confirmed)
+    except _dts.ResumeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=503, detail="无法生成安全恢复记录；未发送任何模型消息")
 
 
 @app.get("/api/dialogue/status/{job_id}")

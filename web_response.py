@@ -74,7 +74,9 @@ def snapshot(page, provider):
     latest = responses.last
     content = latest.locator(body)
     text = "\n\n".join(content.all_inner_texts()).strip()
-    complete = bool(text) and latest.locator(COPY).count() > 0 and not _processing(page)
+    # Rich Gemini cards (weather, search widgets) often have no Copy button.
+    # Completion still requires a stable, changed model-only body.
+    complete = bool(text) and not _processing(page)
     return count, text, complete
 
 
@@ -120,8 +122,18 @@ def wait_for_answer(page, provider, old_count=None, old_text=None, timeout=240, 
         elif text != last_text:
             last_text = text
             stable_since = time.monotonic()
-        elif stable_since is not None and time.monotonic() - stable_since >= 5:
-            return text
+        elif stable_since is not None:
+            # Missing Gemini copy action is common for rich cards; require
+            # longer stability to reduce false positives during streaming.
+            stable_seconds = 5
+            if provider == "gemini" and page is not None:
+                try:
+                    if page.locator("model-response").last.locator(COPY).count() == 0:
+                        stable_seconds = 15
+                except Exception:
+                    stable_seconds = 15
+            if time.monotonic() - stable_since >= stable_seconds:
+                return text
 
         time.sleep(1)
 

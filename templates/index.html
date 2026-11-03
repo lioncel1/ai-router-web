@@ -68,8 +68,19 @@
     <input id="dialogueCount" type="number" min="1" max="100" value="6">
 
     <button type="button" id="stopDialogue" disabled>停止对话</button>
+    <button type="button" id="resumeLastDialogue" disabled>继续最近的对话</button>
     <div id="dialogueHint" style="margin-top:6px;font-size:0.9em;opacity:0.75">
-      默认 6 次模型消息。停止后，当前模型会先完成本次回答，再停止发送给另一个模型。
+      停止不会撤回当前正在执行的模型调用。可从任务中心选择任意已完成/已停止的 Dialogue 继续。
+    </div>
+    <div id="dialogueResumeBox" class="hidden" style="border:1px solid #cbd5e1;border-radius:8px;padding:12px;margin-top:12px">
+      <strong>继续对话（使用原来的模型会话）</strong>
+      <div id="dialogueResumeInfo" style="margin-top:8px;font-size:.9em;white-space:pre-wrap"></div>
+      <label for="dialogueResumePrompt">下一条待发送消息（默认为上次最后一条回答，可修改）</label>
+      <textarea id="dialogueResumePrompt"></textarea>
+      <label for="dialogueResumeCount">本次追加消息数（1～100）</label>
+      <input id="dialogueResumeCount" type="number" min="1" max="100" value="6">
+      <button type="button" id="confirmDialogueResume">确认继续对话</button>
+      <button type="button" id="cancelDialogueResume">取消</button>
     </div>
   </div>
 
@@ -103,6 +114,8 @@ async function readResponse(response) {
 }
 
 let activeDialogueJobId = null;
+let lastFinishedDialogueJobId = null;
+let preparedDialogueJobId = null;
 
 function renderDialogue(data) {
   const messages = data.messages || [];
@@ -144,6 +157,92 @@ $('stopDialogue').addEventListener('click', async () => {
       'afterbegin',
       `<div class="meta bad">${esc(error.message || error)}</div>`
     );
+  }
+});
+
+async function watchDialogue(jobId) {
+  activeDialogueJobId = jobId;
+  $('stopDialogue').disabled = false;
+  try {
+    while (true) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const statusData = await readResponse(await fetch(
+        `/api/dialogue/status/${encodeURIComponent(jobId)}`,
+        {cache: 'no-store'}
+      ));
+      renderDialogue(statusData);
+      if (['done', 'stopped', 'failed'].includes(statusData.status)) {
+        if (['done', 'stopped'].includes(statusData.status) && statusData.completed_messages > 0) {
+          lastFinishedDialogueJobId = jobId;
+          $('resumeLastDialogue').disabled = false;
+        }
+        if (statusData.status === 'failed') throw new Error(statusData.error || 'Dialogue 对话失败');
+        break;
+      }
+    }
+  } finally {
+    activeDialogueJobId = null;
+    $('stopDialogue').disabled = true;
+  }
+}
+
+async function openDialogueResume(jobId) {
+  if (activeDialogueJobId) {
+    window.alert('请等待当前 Dialogue 任务结束再继续其他对话');
+    return;
+  }
+  try {
+    const preview = await readResponse(await fetch(
+      `/api/dialogue/prepare/${encodeURIComponent(jobId)}`,
+      {cache:'no-store'}
+    ));
+    $('provider').value = 'dialogue';
+    $('normalFields').classList.add('hidden');
+    $('dialogueFields').classList.remove('hidden');
+    preparedDialogueJobId = jobId;
+    $('dialogueResumeInfo').textContent =
+      `已完成 ${preview.completed_messages} 条；下一位：${preview.next_provider}（${preview.next_action}）。\n` +
+      `来源任务：${preview.source_job_id}`;
+    $('dialogueResumePrompt').value = preview.default_prompt;
+    $('dialogueResumeCount').value = '6';
+    $('dialogueResumeBox').classList.remove('hidden');
+    $('dialogueResumeBox').scrollIntoView({behavior:'smooth', block:'nearest'});
+  } catch (error) {
+    window.alert('无法继续：' + (error.message || error));
+  }
+}
+window.openDialogueResume = openDialogueResume;
+
+$('resumeLastDialogue').addEventListener('click', () => {
+  if (lastFinishedDialogueJobId) openDialogueResume(lastFinishedDialogueJobId);
+});
+$('cancelDialogueResume').addEventListener('click', () => {
+  $('dialogueResumeBox').classList.add('hidden');
+  preparedDialogueJobId = null;
+});
+$('confirmDialogueResume').addEventListener('click', async () => {
+  if (!preparedDialogueJobId || activeDialogueJobId) return;
+  const prompt = $('dialogueResumePrompt').value;
+  const additionalMessages = Number.parseInt($('dialogueResumeCount').value, 10);
+  if (!prompt.trim() || !Number.isInteger(additionalMessages) || additionalMessages < 1 || additionalMessages > 100) {
+    window.alert('待发送消息不能为空，追加消息数必须为 1～100');
+    return;
+  }
+  const sourceJobId = preparedDialogueJobId;
+  $('confirmDialogueResume').disabled = true;
+  try {
+    const data = await readResponse(await fetch(
+      `/api/dialogue/continue/${encodeURIComponent(sourceJobId)}`,
+      {method:'POST', headers:{'Content-Type':'application/json'},
+       body:JSON.stringify({prompt, additional_messages:additionalMessages})}
+    ));
+    preparedDialogueJobId = null;
+    $('dialogueResumeBox').classList.add('hidden');
+    await watchDialogue(data.job_id);
+  } catch (error) {
+    $('result').textContent = '续聊失败：' + (error.message || error);
+  } finally {
+    $('confirmDialogueResume').disabled = false;
   }
 });
 
@@ -190,27 +289,7 @@ $('send').addEventListener('click', async () => {
         })
       }));
 
-      activeDialogueJobId = startData.job_id;
-      $('stopDialogue').disabled = false;
-
-      while (true) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        const statusData = await readResponse(await fetch(
-          `/api/dialogue/status/${encodeURIComponent(activeDialogueJobId)}`,
-          {cache: 'no-store'}
-        ));
-        renderDialogue(statusData);
-
-        if (['done', 'stopped', 'failed'].includes(statusData.status)) {
-          if (statusData.status === 'failed') {
-            throw new Error(statusData.error || 'Dialogue 对话失败');
-          }
-          break;
-        }
-      }
-
-      activeDialogueJobId = null;
-      $('stopDialogue').disabled = true;
+      await watchDialogue(startData.job_id);
       return;
     }
 
@@ -429,7 +508,7 @@ loadConversations();
 </style>
 <section id="taskCenter" aria-labelledby="taskCenterTitle">
   <h2 id="taskCenterTitle">任务中心 · Task Center</h2>
-  <p class="task-muted">展示已写入 SQLite 的任务；目前普通 Chat 已接入，Auto / Dialogue 历史待后续迁移。旧 JSON 会话不在此列表。</p>
+  <p class="task-muted">展示 SQLite 中的 Chat、Auto 和 Dialogue 历史任务。可打开已完成/已停止的 Dialogue 记录继续对话。旧 JSON 会话不在此列表。</p>
   <div class="task-controls">
     <label for="taskStatusFilter">状态
       <select id="taskStatusFilter">
@@ -502,6 +581,95 @@ loadConversations();
       const t = data.task;
       view.appendChild(textNode('h3', '任务详情 · ' + t.task_id));
       view.appendChild(textNode('p', '类型：' + t.task_type + '　状态：' + t.status + '　创建：' + (t.created_at || '')));
+      if (t.task_type === 'dialogue' && ['done','stopped'].includes(t.status)) {
+        const resumeButton = textNode('button', '从此任务继续对话');
+        resumeButton.type = 'button';
+        resumeButton.addEventListener('click', () => window.openDialogueResume(t.task_id));
+        view.appendChild(resumeButton);
+      }
+      if (t.task_type === 'dialogue' && t.status === 'failed') {
+        let recoveryState;
+        try {
+          recoveryState = await getJSON('/api/dialogue/recovery-status/' + encodeURIComponent(t.task_id));
+        } catch (error) {
+          view.appendChild(textNode('p', '恢复状态查询失败：' + (error.message || error) + '。请勿重复确认恢复。'));
+          recoveryState = {already_recovered: null};
+        }
+        if (recoveryState.already_recovered === true) {
+          view.appendChild(textNode('p', '恢复检查点已创建；原失败任务保留，不需要再次确认恢复。'));
+          view.appendChild(textNode('p', '最新后续任务状态：' + recoveryState.latest_status));
+          const followupButton = textNode('button', '查看最新后续对话');
+          followupButton.type = 'button';
+          followupButton.addEventListener('click', () => openTask(recoveryState.latest_job_id));
+          view.appendChild(followupButton);
+          if (recoveryState.can_continue) {
+            const resumeNewest = textNode('button', '从最新后续对话继续');
+            resumeNewest.type = 'button';
+            resumeNewest.addEventListener('click', () => window.openDialogueResume(recoveryState.latest_job_id));
+            view.appendChild(resumeNewest);
+          }
+        } else if (recoveryState.already_recovered === false) {
+        const verify = textNode('button', '核对网页回答并恢复（不重新发送）');
+        verify.type = 'button';
+        view.appendChild(verify);
+        const recoveryPanel = document.createElement('div');
+        recoveryPanel.style.cssText = 'margin:12px 0;padding:12px;border:1px solid #cbd5e1;border-radius:8px;white-space:pre-wrap';
+        view.appendChild(recoveryPanel);
+        verify.addEventListener('click', async () => {
+          verify.disabled = true;
+          recoveryPanel.replaceChildren(textNode('p', '只读检查原模型网页，不发送新消息……'));
+          try {
+            const preview = await getJSON('/api/dialogue/recover/' + encodeURIComponent(t.task_id));
+            recoveryPanel.replaceChildren();
+            recoveryPanel.appendChild(textNode('strong', '网页回答核对 · #' + preview.index + ' ' + preview.provider));
+            appendBlock(recoveryPanel, '本轮原始提问', preview.original_prompt);
+            appendBlock(recoveryPanel, '从原网页读取的候选回答（请仔细核对）', preview.answer);
+            const link = document.createElement('a');
+            link.textContent = '打开原模型会话核对';
+            link.href = preview.conversation_url;
+            link.target = '_blank';
+            link.rel = 'noopener noreferrer';
+            recoveryPanel.appendChild(link);
+            recoveryPanel.appendChild(textNode('p', preview.warning));
+            const confirmation = document.createElement('label');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            confirmation.appendChild(checkbox);
+            confirmation.appendChild(document.createTextNode(' 我已核对：这确实是本轮问题的回复，且没有被转发给下一模型'));
+            recoveryPanel.appendChild(confirmation);
+            const confirmButton = textNode('button', '确认保存恢复检查点');
+            confirmButton.type = 'button';
+            confirmButton.disabled = true;
+            checkbox.addEventListener('change', () => { confirmButton.disabled = !checkbox.checked; });
+            recoveryPanel.appendChild(confirmButton);
+            confirmButton.addEventListener('click', async () => {
+              confirmButton.disabled = true;
+              try {
+                const resp = await fetch('/api/dialogue/recover/' + encodeURIComponent(t.task_id), {
+                  method: 'POST', headers: {'Content-Type':'application/json'},
+                  body: JSON.stringify({answer_hash: preview.answer_hash, confirmed:true})
+                });
+                if (!resp.ok) {
+                  const err = await resp.json();
+                  throw new Error(err.detail || ('HTTP ' + resp.status));
+                }
+                const result = await resp.json();
+                recoveryPanel.replaceChildren(textNode('p', '回答已保存为独立恢复检查点，未向模型发送消息。'));
+                const continueButton = textNode('button', '从已恢复回答继续对话');
+                continueButton.type = 'button';
+                continueButton.addEventListener('click', () => window.openDialogueResume(result.recovered_job_id));
+                recoveryPanel.appendChild(continueButton);
+              } catch (error) {
+                recoveryPanel.appendChild(textNode('p', '无法再次保存：' + (error.message || error) + '。正在查询已有恢复记录。'));
+                await openTask(t.task_id);
+              }
+            });
+          } catch (error) {
+            recoveryPanel.replaceChildren(textNode('p', '无法自动核对：' + (error.message || error) + '。请保持 pending，不要重发。'));
+          } finally { verify.disabled = false; }
+        });
+        }
+      }
       appendBlock(view, '原始问题', t.original_input || '');
       if (t.result_summary) appendBlock(view, '结果摘要', t.result_summary);
       if (t.error_message) appendBlock(view, '错误信息', t.error_message);
