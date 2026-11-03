@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>AI Router Gateway</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 920px; margin: 32px auto; padding: 0 16px; color: #0f172a; }
+    h1 { margin-bottom: 20px; }
+    label { display:block; margin: 12px 0 6px; font-weight: 600; }
+    select, input, textarea, button { box-sizing:border-box; width:100%; font:inherit; padding:9px 10px; border:1px solid #cbd5e1; border-radius:7px; }
+    textarea { min-height: 180px; resize: vertical; }
+    button { margin-top:14px; cursor:pointer; font-weight:700; }
+    #result { margin-top:22px; white-space:pre-wrap; word-break:break-word; }
+    .meta { padding:12px; border:1px solid #cbd5e1; border-radius:8px; margin-bottom:14px; }
+    .ok { border-color:#16a34a; }
+    .bad { border-color:#dc2626; }
+    .hidden { display:none; }
+    details { margin:12px 0; }
+  </style>
+</head>
+<body>
+  <h1>AI Router Gateway</h1>
+
+  <label for="provider">Provider</label>
+  <select id="provider">
+    <option value="gemini">Gemini</option>
+    <option value="chatgpt">ChatGPT</option>
+    <option value="auto">Auto（分析 → 审查 → 综合）</option>
+    <option value="dialogue">Dialogue（双模型对话）</option>
+  </select>
+
+  <div id="normalFields">
+    <label for="action">Action</label>
+    <select id="action">
+      <option value="new">新建会话（new）</option>
+      <option value="ask">继续会话（ask）</option>
+    </select>
+
+    <label for="conversation">Conversation</label>
+    <input id="conversation" list="conversationNames" placeholder="留空则自动生成">
+    <datalist id="conversationNames"></datalist>
+    <!-- conversation management v0.7 -->
+    <div id="conversationTools" style="margin-top:8px">
+      <select id="conversationList" style="max-width:100%">
+        <option value="">— 选择已有会话 —</option>
+      </select>
+      <button type="button" id="refreshConversations">刷新会话</button>
+      <button type="button" id="importConversation">导入已有会话</button>
+    </div>
+    <div id="conversationHint" style="margin-top:6px;font-size:0.9em;opacity:0.75"></div>
+  </div>
+
+  <div id="dialogueFields" class="hidden">
+    <label for="dialogueFirst">发问模型</label>
+    <select id="dialogueFirst">
+      <option value="gemini">Gemini</option>
+      <option value="chatgpt">ChatGPT</option>
+    </select>
+
+    <label for="dialogueSecond">对话模型</label>
+    <select id="dialogueSecond">
+      <option value="chatgpt">ChatGPT</option>
+      <option value="gemini">Gemini</option>
+    </select>
+
+    <label for="dialogueCount">对话次数（按模型消息计数；双方一轮往返 = 2 次）</label>
+    <input id="dialogueCount" type="number" min="1" max="100" value="6">
+
+    <button type="button" id="stopDialogue" disabled>停止对话</button>
+    <div id="dialogueHint" style="margin-top:6px;font-size:0.9em;opacity:0.75">
+      默认 6 次模型消息。停止后，当前模型会先完成本次回答，再停止发送给另一个模型。
+    </div>
+  </div>
+
+  <label for="prompt">Prompt</label>
+  <textarea id="prompt" placeholder="输入你的问题"></textarea>
+
+  <button id="send">发送</button>
+
+  <div id="result"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const esc = value => String(value ?? '')
+  .replaceAll('&','&amp;')
+  .replaceAll('<','&lt;')
+  .replaceAll('>','&gt;')
+  .replaceAll('"','&quot;')
+  .replaceAll("'",'&#39;');
+
+async function readResponse(response) {
+  const text = await response.text();
+  if (!text.trim()) throw new Error(`服务器返回空响应（HTTP ${response.status}），请检查网关状态。`);
+  let data;
+  try { data = JSON.parse(text); }
+  catch (_) { throw new Error(`服务器未返回有效 JSON（HTTP ${response.status}），可能是代理超时或登录失效。`); }
+  if (!response.ok) {
+    const detail = Array.isArray(data.detail) ? data.detail.map(x => x.msg).join('；') : data.detail;
+    throw new Error(detail || data.error || `HTTP ${response.status}`);
+  }
+  return data;
+}
+
+let activeDialogueJobId = null;
+
+function renderDialogue(data) {
+  const messages = data.messages || [];
+  let body = '';
+  for (const item of messages) {
+    body +=
+      `<div style="margin:14px 0;padding:12px;border:1px solid #cbd5e1;border-radius:8px">` +
+      `<strong>#${esc(item.index)} · ${esc(item.provider)}</strong>` +
+      `${item.duration_ms ? ` · ${esc(item.duration_ms)} ms` : ''}<br>` +
+      `<div style="white-space:pre-wrap;margin-top:8px">${esc(item.answer)}</div>` +
+      `${item.conversation_url ? `<div style="margin-top:8px"><a href="${esc(item.conversation_url)}" target="_blank" rel="noopener noreferrer">打开该模型会话</a></div>` : ''}` +
+      `</div>`;
+  }
+
+  const current = data.current_provider
+    ? ` · 当前：${esc(data.current_provider)}`
+    : '';
+
+  $('result').innerHTML =
+    `<div class="meta ${data.status === 'failed' ? 'bad' : 'ok'}">` +
+    `<strong>模式：</strong>Dialogue<br>` +
+    `<strong>状态：</strong>${esc(data.status)}${current}<br>` +
+    `<strong>消息：</strong>${esc(data.completed_messages || 0)} / ${esc(data.max_messages || 0)}` +
+    `${data.stop_requested && data.status === 'running' ? '<br><strong>停止：</strong>已请求，将在当前模型回答完成后停止' : ''}` +
+    `${data.error ? `<br><strong>错误：</strong>${esc(data.error)}` : ''}` +
+    `</div>` + body;
+}
+
+$('stopDialogue').addEventListener('click', async () => {
+  if (!activeDialogueJobId) return;
+  $('stopDialogue').disabled = true;
+  try {
+    await readResponse(await fetch(
+      `/api/dialogue/stop/${encodeURIComponent(activeDialogueJobId)}`,
+      {method: 'POST'}
+    ));
+  } catch (error) {
+    $('result').insertAdjacentHTML(
+      'afterbegin',
+      `<div class="meta bad">${esc(error.message || error)}</div>`
+    );
+  }
+});
+
+$('provider').addEventListener('change', () => {
+  const mode = $('provider').value;
+  $('normalFields').classList.toggle('hidden', mode === 'auto' || mode === 'dialogue');
+  $('dialogueFields').classList.toggle('hidden', mode !== 'dialogue');
+});
+
+$('send').addEventListener('click', async () => {
+  const result = $('result');
+  const provider = $('provider').value;
+  const prompt = $('prompt').value.trim();
+
+  if (!prompt) {
+    result.innerHTML = '<div class="meta bad">Prompt 不能为空</div>';
+    return;
+  }
+
+  $('send').disabled = true;
+  result.textContent = '处理中，请稍候……';
+
+  try {
+    if (provider === 'dialogue') {
+      const firstProvider = $('dialogueFirst').value;
+      const secondProvider = $('dialogueSecond').value;
+      const maxMessages = Number.parseInt($('dialogueCount').value, 10);
+
+      if (firstProvider === secondProvider) {
+        throw new Error('发问模型和对话模型不能相同');
+      }
+      if (!Number.isInteger(maxMessages) || maxMessages < 1 || maxMessages > 100) {
+        throw new Error('对话次数请输入 1～100 的整数');
+      }
+
+      const startData = await readResponse(await fetch('/api/dialogue/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          prompt,
+          first_provider: firstProvider,
+          second_provider: secondProvider,
+          max_messages: maxMessages
+        })
+      }));
+
+      activeDialogueJobId = startData.job_id;
+      $('stopDialogue').disabled = false;
+
+      while (true) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const statusData = await readResponse(await fetch(
+          `/api/dialogue/status/${encodeURIComponent(activeDialogueJobId)}`,
+          {cache: 'no-store'}
+        ));
+        renderDialogue(statusData);
+
+        if (['done', 'stopped', 'failed'].includes(statusData.status)) {
+          if (statusData.status === 'failed') {
+            throw new Error(statusData.error || 'Dialogue 对话失败');
+          }
+          break;
+        }
+      }
+
+      activeDialogueJobId = null;
+      $('stopDialogue').disabled = true;
+      return;
+    }
+
+    if (provider === 'auto') {
+      const startResponse = await fetch('/api/orchestrate/start', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({prompt})
+      });
+
+      const startData = await readResponse(startResponse);
+      if (!startData.job_id) {
+        throw new Error(startData.error || 'Auto任务创建失败');
+      }
+
+      let data = null;
+      while (true) {
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        const statusResponse = await fetch(
+          `/api/orchestrate/status/${encodeURIComponent(startData.job_id)}`,
+          {cache: 'no-store'}
+        );
+        const statusData = await readResponse(statusResponse);
+
+        if (statusData.status === 'done') {
+          data = statusData.result;
+          break;
+        }
+        if (statusData.status === 'failed' || statusData.status === 'missing') {
+          throw new Error(statusData.error || 'Auto编排失败');
+        }
+        result.textContent = `处理中，请稍候…… ${statusData.status || ''}`;
+      }
+
+      const finalAnswer = data.final_answer || (data.success ? '无返回内容' : '编排失败，未生成最终答案');
+      const stages = data.stages || [];
+
+      let stageHtml = '';
+      for (const stage of stages) {
+        stageHtml += `<details><summary>${esc(stage.provider)} / ${esc(stage.role)} · ${stage.success ? '完成' : '失败'} · ${esc(stage.duration_ms)} ms · 重试 ${esc(stage.retry_count)}</summary>${esc(stage.answer || stage.quality_reason || '')}</details>`;
+      }
+
+      result.innerHTML =
+        `<div class="meta ${data.success ? 'ok' : 'bad'}">` +
+        `<strong>模式：</strong>Auto<br>` +
+        `<strong>Route：</strong>${esc(data.route_id)}<br>` +
+        `<strong>是否成功：</strong>${data.success ? '是' : '否'}<br>` +
+        `<strong>调用耗时：</strong>${esc(data.duration_ms)} ms` +
+        `${data.error ? `<br><strong>错误：</strong>${esc(data.error)}` : ''}` +
+        `</div>` +
+        stageHtml +
+        `<hr><strong>最终答案：</strong><br>${esc(finalAnswer)}`;
+    } else {
+      const payload = {
+        provider,
+        action: $('action').value,
+        conversation_name: $('conversation').value,
+        prompt
+      };
+
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+      });
+
+      const data = await readResponse(response);
+      const url = data.conversation_url
+        ? `<br><strong>会话地址：</strong><a href="${esc(data.conversation_url)}" target="_blank" rel="noopener noreferrer">${esc(data.conversation_url)}</a>`
+        : '';
+
+      result.innerHTML =
+        `<div class="meta ${data.success ? 'ok' : 'bad'}">` +
+        `<strong>是否成功：</strong>${data.success ? '是' : '否'}<br>` +
+        `<strong>Provider：</strong>${esc(data.provider)}<br>` +
+        `<strong>会话名称：</strong>${esc(data.conversation_name)}<br>` +
+        `<strong>调用耗时：</strong>${esc(data.duration_ms)} ms<br>` +
+        `<strong>exit code：</strong>${esc(data.exit_code)}` +
+        `${data.error ? `<br><strong>错误：</strong>${esc(data.error)}` : ''}` +
+        `${url}</div><hr><strong>模型返回内容：</strong><br>` +
+        `${esc(data.answer || '无有效回答')}`;
+    }
+  } catch (err) {
+    result.innerHTML = `<div class="meta bad"><strong>请求失败：</strong>${esc(err)}</div>`;
+  } finally {
+    $('send').disabled = false;
+  }
+});
+
+// === conversation management v0.7 ===
+async function loadConversations() {
+  const provider = $('provider').value;
+  const list = $('conversationList');
+  const names = $('conversationNames');
+  if (!list || !names) return;
+  list.innerHTML = '<option value="">— 选择已有会话 —</option>';
+  names.innerHTML = '';
+  if (provider === 'auto' || provider === 'dialogue') return;
+
+  try {
+    const response = await fetch(`/api/conversations?provider=${encodeURIComponent(provider)}`);
+    const data = await readResponse(response);
+    for (const item of data.conversations || []) {
+      const label = item.status === 'pending'
+        ? `${item.name} [pending，不可继续]`
+        : `${item.name}${item.updated_at ? ' · ' + item.updated_at : ''}`;
+
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.textContent = label;
+      if (item.status === 'pending') option.disabled = true;
+      list.appendChild(option);
+
+      if (item.status !== 'pending') {
+        const d = document.createElement('option');
+        d.value = item.name;
+        names.appendChild(d);
+      }
+    }
+  } catch (error) {
+    $('conversationHint').textContent = `读取会话失败：${error.message}`;
+  }
+}
+
+function updateConversationUi() {
+  const provider = $('provider').value;
+  const action = $('action').value;
+  const tools = $('conversationTools');
+  const hint = $('conversationHint');
+  if (!tools || !hint) return;
+
+  if (provider === 'auto') {
+    tools.classList.add('hidden');
+    hint.textContent = '';
+    return;
+  }
+
+  tools.classList.remove('hidden');
+  $('conversationList').style.display = action === 'ask' ? '' : 'none';
+  $('refreshConversations').style.display = action === 'ask' ? '' : 'none';
+
+  if (action === 'ask') {
+    $('conversation').placeholder = '从已有会话中选择，或填写会话名';
+    hint.textContent = '继续会话：优先从下拉列表选择。pending 会话不会允许直接继续。';
+  } else {
+    $('conversation').placeholder = '新名称；留空则自动生成';
+    hint.textContent = '新建会话：同一 Provider 内名称不可重复；Gemini 与 ChatGPT 可使用相同名称。';
+  }
+}
+
+$('conversationList').addEventListener('change', () => {
+  if ($('conversationList').value) $('conversation').value = $('conversationList').value;
+});
+
+$('refreshConversations').addEventListener('click', loadConversations);
+
+$('importConversation').addEventListener('click', async () => {
+  const provider = $('provider').value;
+  if (provider === 'auto' || provider === 'dialogue') return;
+
+  const name = window.prompt('给这个已有会话设置一个 Router 名称：');
+  if (!name || !name.trim()) return;
+
+  const example = provider === 'gemini'
+    ? 'https://gemini.google.com/app/...'
+    : 'https://chatgpt.com/c/...';
+  const url = window.prompt(`粘贴已有 ${provider === 'gemini' ? 'Gemini' : 'ChatGPT'} 会话 URL：\\n${example}`);
+  if (!url || !url.trim()) return;
+
+  try {
+    const response = await fetch('/api/conversations/import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        provider,
+        conversation_name: name.trim(),
+        url: url.trim()
+      })
+    });
+    const data = await readResponse(response);
+    await loadConversations();
+    $('action').value = 'ask';
+    $('conversation').value = data.conversation_name;
+    updateConversationUi();
+    window.alert(`导入成功：${data.conversation_name}`);
+  } catch (error) {
+    window.alert(`导入失败：${error.message}`);
+  }
+});
+
+$('provider').addEventListener('change', async () => {
+  updateConversationUi();
+  await loadConversations();
+});
+
+$('action').addEventListener('change', updateConversationUi);
+
+updateConversationUi();
+loadConversations();
+
+</script>
+<!-- AI_ROUTER_TASK_CENTER_PHASE4_START -->
+<style>
+#taskCenter { margin: 28px 0 0; padding: 18px; border: 1px solid #cbd5e1; border-radius: 10px; }
+#taskCenter .task-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+#taskCenter .task-controls > label { flex: 1 1 160px; margin: 0; }
+#taskCenter .task-controls > button { width: auto; margin: 0; }
+#taskCenter .task-row { width: 100%; text-align: left; background: transparent; padding: 12px; margin: 8px 0; font-weight: normal; border: 1px solid #cbd5e1; }
+#taskCenter .task-row:focus-visible { outline: 2px solid #2563eb; }
+#taskCenter .task-muted { opacity: .7; font-size: .9em; }
+#taskCenter .task-pager { display: flex; align-items: center; gap: 12px; }
+#taskCenter .task-pager button { width: auto; }
+#taskCenter pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #f1f5f9; padding: 10px; border-radius: 6px; }
+#taskCenter .task-detail { border-top: 1px solid #cbd5e1; margin-top: 16px; padding-top: 12px; }
+#taskCenter .task-detail a { overflow-wrap: anywhere; }
+</style>
+<section id="taskCenter" aria-labelledby="taskCenterTitle">
+  <h2 id="taskCenterTitle">任务中心 · Task Center</h2>
+  <p class="task-muted">展示已写入 SQLite 的任务；目前普通 Chat 已接入，Auto / Dialogue 历史待后续迁移。旧 JSON 会话不在此列表。</p>
+  <div class="task-controls">
+    <label for="taskStatusFilter">状态
+      <select id="taskStatusFilter">
+        <option value="">全部状态</option>
+        <option value="queued">queued</option><option value="running">running</option>
+        <option value="waiting_user">waiting_user</option><option value="paused">paused</option>
+        <option value="done">done</option><option value="failed">failed</option>
+        <option value="stopped">stopped</option>
+      </select>
+    </label>
+    <label for="taskTypeFilter">类型
+      <select id="taskTypeFilter">
+        <option value="">全部类型</option><option value="chat">Chat</option>
+        <option value="auto">Auto</option><option value="dialogue">Dialogue</option>
+      </select>
+    </label>
+    <button id="taskRefresh" type="button">刷新任务</button>
+  </div>
+  <p id="taskMessage" role="status" aria-live="polite" class="task-muted"></p>
+  <div id="taskRows"></div>
+  <div class="task-pager">
+    <button id="taskPrev" type="button" disabled>上一页</button>
+    <span id="taskPagerInfo" class="task-muted"></span>
+    <button id="taskNext" type="button" disabled>下一页</button>
+  </div>
+  <div id="taskDetail" class="task-detail" hidden></div>
+</section>
+<script>
+// Task Center: all server-provided values are assigned via textContent, never innerHTML.
+(() => {
+  'use strict';
+  const id = s => document.getElementById(s);
+  const size = 20;
+  let offset = 0;
+  let total = 0;
+  let generation = 0;
+  const textNode = (tag, value, cls) => {
+    const el = document.createElement(tag);
+    el.textContent = String(value ?? '');
+    if (cls) el.className = cls;
+    return el;
+  };
+  const appendBlock = (container, title, value) => {
+    container.appendChild(textNode('h4', title));
+    container.appendChild(textNode('pre', value));
+  };
+  const query = () => {
+    const p = new URLSearchParams({limit: String(size), offset: String(offset)});
+    if (id('taskStatusFilter').value) p.set('status', id('taskStatusFilter').value);
+    if (id('taskTypeFilter').value) p.set('task_type', id('taskTypeFilter').value);
+    return p;
+  };
+  async function getJSON(path) {
+    const response = await fetch(path, {cache:'no-store'});
+    const body = await response.text();
+    if (!body.trim()) throw new Error('空响应（HTTP ' + response.status + '）');
+    let data;
+    try { data = JSON.parse(body); }
+    catch (_) { throw new Error('无效 JSON（HTTP ' + response.status + '）'); }
+    if (!response.ok) throw new Error(typeof data.detail === 'string' ? data.detail : 'HTTP ' + response.status);
+    return data;
+  }
+  async function openTask(taskId) {
+    const view = id('taskDetail');
+    view.hidden = false;
+    view.replaceChildren(textNode('p', '正在读取任务详情……'));
+    try {
+      const data = await getJSON('/api/tasks/' + encodeURIComponent(taskId));
+      view.replaceChildren();
+      const t = data.task;
+      view.appendChild(textNode('h3', '任务详情 · ' + t.task_id));
+      view.appendChild(textNode('p', '类型：' + t.task_type + '　状态：' + t.status + '　创建：' + (t.created_at || '')));
+      appendBlock(view, '原始问题', t.original_input || '');
+      if (t.result_summary) appendBlock(view, '结果摘要', t.result_summary);
+      if (t.error_message) appendBlock(view, '错误信息', t.error_message);
+      const messages = Array.isArray(data.messages) ? data.messages : [];
+      view.appendChild(textNode('h4', '消息记录（' + messages.length + '）'));
+      for (const m of messages) {
+        appendBlock(view, (m.sequence_no ?? '-') + ' · ' + m.role + (m.provider ? ' · ' + m.provider : ''), m.content || '');
+      }
+      const calls = Array.isArray(data.provider_calls) ? data.provider_calls : [];
+      view.appendChild(textNode('h4', '模型调用（' + calls.length + '）'));
+      for (const c of calls) {
+        view.appendChild(textNode('p', [c.provider, c.transport, c.action, c.status, c.duration_ms == null ? '' : c.duration_ms + 'ms'].filter(Boolean).join(' · ')));
+        if (c.quality_reason) view.appendChild(textNode('p', '质量判断：' + c.quality_reason));
+        if (c.conversation_url && (
+          c.conversation_url.startsWith('https://chatgpt.com/c/') ||
+          c.conversation_url.startsWith('https://gemini.google.com/app/')
+        )) {
+          const link = document.createElement('a');
+          link.href = c.conversation_url;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = '打开模型会话';
+          view.appendChild(link);
+        }
+      }
+      const events = Array.isArray(data.events) ? data.events : [];
+      view.appendChild(textNode('h4', '任务事件（' + events.length + '）'));
+      for (const e of events) view.appendChild(textNode('p', (e.created_at || '') + ' · ' + e.event_type));
+    } catch (error) {
+      view.replaceChildren(textNode('p', '读取详情失败：' + error.message));
+    }
+  }
+  async function refresh() {
+    const current = ++generation;
+    id('taskMessage').textContent = '正在加载任务……';
+    id('taskRefresh').disabled = true;
+    try {
+      const data = await getJSON('/api/tasks?' + query().toString());
+      if (current !== generation) return;
+      total = data.total;
+      const rows = id('taskRows');
+      rows.replaceChildren();
+      id('taskDetail').hidden = true;
+      id('taskDetail').replaceChildren();
+      for (const t of data.items) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'task-row';
+        b.appendChild(textNode('strong', (t.title || t.task_type) + ' · ' + t.status));
+        b.appendChild(textNode('div', (t.created_at || '') + ' · ' + t.task_id, 'task-muted'));
+        b.addEventListener('click', () => openTask(t.task_id));
+        rows.appendChild(b);
+      }
+      id('taskMessage').textContent = data.items.length ? '' : '暂无符合条件的任务';
+      id('taskPagerInfo').textContent = '第 ' + (data.items.length ? offset + 1 : 0) + '–' + (offset + data.items.length) + ' 条 / 共 ' + total + ' 条';
+      id('taskPrev').disabled = offset === 0;
+      id('taskNext').disabled = offset + size >= total;
+    } catch (error) {
+      if (current === generation) id('taskMessage').textContent = '任务读取失败：' + error.message;
+    } finally {
+      if (current === generation) id('taskRefresh').disabled = false;
+    }
+  }
+  id('taskRefresh').addEventListener('click', refresh);
+  for (const key of ['taskStatusFilter','taskTypeFilter']) {
+    id(key).addEventListener('change', () => { offset = 0; refresh(); });
+  }
+  id('taskPrev').addEventListener('click', () => { offset = Math.max(0, offset - size); refresh(); });
+  id('taskNext').addEventListener('click', () => { if (offset + size < total) { offset += size; refresh(); } });
+  refresh();
+})();
+</script>
+<!-- AI_ROUTER_TASK_CENTER_PHASE4_END -->
+
+</body>
+</html>

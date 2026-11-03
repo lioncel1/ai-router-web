@@ -1,0 +1,21 @@
+@app.post("/api/dialogue/stop/{job_id}")
+async def dialogue_stop(job_id: str):
+    # Persist stop intent first. Do not cancel the in-flight Web request.
+    try:
+        outcome = await asyncio.to_thread(_dts.request_dialogue_stop, job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Dialogue job not found")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Dialogue stop could not be persisted")
+    with DIALOGUE_JOBS_LOCK:
+        job = DIALOGUE_JOBS.get(job_id)
+        if job is not None and outcome["accepted"]:
+            job["stop_requested"] = True
+            if outcome["status"] == "stopped":
+                job["status"] = "stopped"
+                job["current_provider"] = ""
+    return {
+        "success": True, "job_id": job_id,
+        "status": outcome["status"],
+        "stop_requested": bool(outcome["accepted"]),
+    }

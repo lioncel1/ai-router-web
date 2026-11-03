@@ -1,0 +1,6 @@
+# Tested with Python 3.12; intentionally broad compatible ranges.
+fastapi>=0.110,<1
+pydantic>=2,<3
+uvicorn>=0.25,<1
+playwright>=1.45,<2
+pytest>=8,<10

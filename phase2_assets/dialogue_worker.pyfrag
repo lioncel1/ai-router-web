@@ -1,0 +1,121 @@
+def _run_dialogue_job(
+    job_id: str,
+    first_provider: str,
+    second_provider: str,
+    prompt: str,
+    max_messages: int,
+) -> None:
+    # Keep original v0.7 routing: raw user prompt to A, then exact previous
+    # model answer to the other provider. No hidden system or role injection.
+    names = {
+        first_provider: f"dialogue-{job_id[:8]}-{first_provider}",
+        second_provider: f"dialogue-{job_id[:8]}-{second_provider}",
+    }
+    started: set[str] = set()
+    current = first_provider
+    incoming = prompt
+
+    def end(status: str, error: str = "") -> None:
+        with DIALOGUE_JOBS_LOCK:
+            job = DIALOGUE_JOBS[job_id]
+            job["status"] = status
+            job["current_provider"] = ""
+            job["error"] = error
+
+    # A queued task may have been stopped before this worker was scheduled.
+    try:
+        state = _dts.start_dialogue_task(job_id)
+    except Exception as exc:
+        end("failed", f"Task start failed: {type(exc).__name__}")
+        return
+    if state == "stopped":
+        end("stopped")
+        return
+
+    with DIALOGUE_JOBS_LOCK:
+        DIALOGUE_JOBS[job_id]["status"] = "running"
+        DIALOGUE_JOBS[job_id]["current_provider"] = current
+
+    for index in range(max_messages):
+        try:
+            if _dts.checkpoint(job_id) == "stopped":
+                end("stopped")
+                return
+        except Exception as exc:
+            end("failed", f"Task checkpoint failed: {type(exc).__name__}")
+            return
+
+        with DIALOGUE_JOBS_LOCK:
+            DIALOGUE_JOBS[job_id]["current_provider"] = current
+
+        other = second_provider if current == first_provider else first_provider
+        provider_prompt = incoming
+        action = "ask" if current in started else "new"
+        try:
+            result = run_provider(current, action, names[current], provider_prompt)
+        except Exception as exc:
+            error = f"{current} 调用异常：{type(exc).__name__}"
+            try:
+                _dts.fail_dialogue_task(job_id, code="provider_exception", reason=error)
+            except Exception:
+                pass
+            end("failed", error)
+            return
+
+        try:
+            recorded = _dts.record_dialogue_step(
+                job_id, index=index + 1, provider=current, action=action,
+                prompt=provider_prompt, conversation_name=names[current], result=result,
+            )
+        except Exception as exc:
+            # The call has already happened. Stop at this boundary; do not
+            # send to the other model when we cannot persist the result.
+            error = f"Dialogue history write failed: {type(exc).__name__}; no retry"
+            try:
+                _dts.fail_dialogue_task(job_id, code="history_write_failed", reason=error)
+            except Exception:
+                pass
+            end("failed", error)
+            return
+
+        if recorded != "done":
+            error = (result.get("error") or result.get("quality_reason")
+                     or f"{current} 未返回有效回答")
+            try:
+                _dts.fail_dialogue_task(job_id, code="provider_failed", reason=error)
+            except Exception:
+                pass
+            end("failed", error)
+            return
+
+        # Completed and checked model output; only this exact answer may be
+        # forwarded as the next provider prompt.
+        answer = (result.get("answer") or "").strip()
+        started.add(current)
+        incoming = answer
+        message = {
+            "index": index + 1, "provider": current, "answer": answer,
+            "duration_ms": result.get("duration_ms", 0),
+            "conversation_name": names[current],
+            "conversation_url": result.get("conversation_url", ""),
+        }
+        with DIALOGUE_JOBS_LOCK:
+            job = DIALOGUE_JOBS[job_id]
+            job["messages"].append(message)
+            job["completed_messages"] = len(job["messages"])
+
+        try:
+            if _dts.checkpoint(job_id) == "stopped":
+                end("stopped")
+                return
+        except Exception as exc:
+            end("failed", f"Task checkpoint failed: {type(exc).__name__}")
+            return
+        current = other
+
+    try:
+        final = _dts.complete_dialogue_task(job_id)
+    except Exception as exc:
+        end("failed", f"Task completion failed: {type(exc).__name__}")
+        return
+    end(final)

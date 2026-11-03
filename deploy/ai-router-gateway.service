@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Router Gateway
+After=network.target
+
+[Service]
+WorkingDirectory=/home/ubuntu/ai-router
+ExecStart=/home/ubuntu/ai-router/.venv/bin/uvicorn gateway_app:app --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=5
+UMask=0077
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
