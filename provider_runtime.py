@@ -7,13 +7,27 @@ import time
 from pathlib import Path
 
 from quality import check_quality
+from provider_transport import dispatch_provider
 from router_log import ANSI_ESCAPE_RE, extract_answer, extract_conversation_url, is_valid_conversation_url
 
 BASE_DIR = Path(__file__).resolve().parent
 PROVIDERS = {'gemini', 'chatgpt'}
 
 
-def run_provider(provider, action, conversation_name, prompt, *, role='answer', task=None, timeout=300):
+# AI_ROUTER_V010_PHASE1_PROVIDER_DISPATCH
+def run_provider(provider, action, conversation_name, prompt, *,
+                 role='answer', task=None, timeout=300, transport='web'):
+    """Preserve Web behavior; API fails closed until installed."""
+    if provider not in PROVIDERS or action not in {'new', 'ask'}:
+        raise ValueError('unsupported provider or action')
+    return dispatch_provider(
+        provider, action, conversation_name, prompt,
+        transport=transport, web_call=_run_web_provider,
+        role=role, task=task, timeout=timeout,
+    )
+
+
+def _run_web_provider(provider, action, conversation_name, prompt, *, role='answer', task=None, timeout=300):
     if provider not in PROVIDERS or action not in {'new', 'ask'}:
         raise ValueError('unsupported provider or action')
     started = time.monotonic()

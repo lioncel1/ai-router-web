@@ -336,3 +336,111 @@ def get_provider_calls(task_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in conn.execute(
             "SELECT * FROM provider_calls WHERE task_id=? ORDER BY started_at,rowid", (task_id,)
         ).fetchall()]
+
+
+def create_dialogue_recovery_checkpoint(
+    *, task_id: str, parent_job_id: str, root_job_id: str,
+    first: str, second: str, provider: str, index: int, answer: str,
+    conversation_name: str, conversation_url: str, answer_hash: str,
+) -> None:
+    """Atomically store a user-confirmed Web answer as a terminal child Task.
+
+    No provider_call is invented. The original failed Task and its audit log
+    remain unchanged. A deterministic task_id rejects concurrent repeats.
+    """
+    if not answer.strip() or provider not in {first, second} or first == second or index < 1:
+        raise ValueError("invalid recovery checkpoint")
+    now = utc_now()
+    meta = {"workflow": "dialogue", "parent_job_id": parent_job_id,
+            "root_job_id": root_job_id, "first_provider": first,
+            "second_provider": second, "max_messages": 1,
+            "recovered_from_web": True, "recovered_index": index}
+    turn = {"index": index, "provider": provider, "answer": answer,
+            "duration_ms": 0, "conversation_name": conversation_name,
+            "conversation_url": conversation_url, "recovered": True}
+    with _tx() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        original = conn.execute("SELECT status,task_type FROM tasks WHERE task_id=?", (parent_job_id,)).fetchone()
+        if original is None or original["status"] != "failed" or original["task_type"] != "dialogue":
+            raise ValueError("source task not recoverable")
+        conn.execute(
+            """INSERT INTO tasks
+               (task_id,task_type,source,status,title,original_input,result_summary,
+                created_at,updated_at,finished_at,metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (task_id, "dialogue", "web", "stopped",
+             f"Dialogue 回答找回: {provider} #{index}", answer,
+             "User-confirmed Web answer recovered; no new provider call",
+             now, now, now, _json(meta)),
+        )
+        conn.execute(
+            """INSERT INTO messages
+               (message_id,task_id,role,provider,transport,content,sequence_no,created_at,metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), task_id, "assistant", provider, "web", answer, 1, now,
+             _json({"dialogue_index": index, "conversation_name": conversation_name,
+                    "conversation_url": conversation_url, "recovered": True,
+                    "user_confirmed": True})),
+        )
+        for event_type, body in (
+            ("task_created", {"status": "stopped", "recovery": True}),
+            ("dialogue_turn", turn),
+            ("web_answer_recovered", {"source_job_id": parent_job_id,
+                                      "provider": provider, "index": index,
+                                      "answer_sha256": answer_hash,
+                                      "confirmed_by_user": True}),
+        ):
+            conn.execute(
+                """INSERT INTO task_events(event_id,task_id,event_type,event_data_json,created_at)
+                   VALUES (?,?,?,?,?)""",
+                (str(uuid4()), task_id, event_type, _json(body), now),
+            )
+
+
+
+def record_dialogue_step_atomic(
+    task_id: str, *, provider: str, action: str, status: str,
+    duration_ms: int | None, input_length: int | None, output_length: int | None,
+    quality_ok: bool | None, quality_reason: str | None,
+    conversation_url: str | None, error_message: str | None,
+    metadata: dict[str, Any], message: dict[str, Any] | None,
+) -> None:
+    """Commit provider outcome + assistant turn + dialogue event in one transaction.
+
+    A crash can leave a dispatch intent without an outcome, but never a
+    visible Dialogue turn that lacks its recorded provider outcome.
+    """
+    if message is not None and (status != "done" or not message.get("answer", "").strip()):
+        raise ValueError("message requires successful nonempty provider output")
+    with _tx() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _require_task(conn, task_id)
+        conn.execute(
+            """INSERT INTO provider_calls
+               (call_id,task_id,provider,transport,action,status,duration_ms,input_length,
+                output_length,quality_ok,quality_reason,conversation_url,error_message,
+                metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), task_id, provider, "web", action, status, duration_ms,
+             input_length, output_length, None if quality_ok is None else int(quality_ok),
+             quality_reason, conversation_url, error_message, _json(metadata)),
+        )
+        if message is None:
+            return
+        next_seq = conn.execute(
+            "SELECT COALESCE(MAX(sequence_no),0)+1 FROM messages WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO messages
+               (message_id,task_id,role,provider,transport,content,sequence_no,created_at,metadata_json)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (str(uuid4()), task_id, "assistant", provider, "web", message["answer"],
+             next_seq, utc_now(), _json({"dialogue_index": message["index"],
+                                        "conversation_name": message["conversation_name"],
+                                        "conversation_url": message.get("conversation_url", "")})),
+        )
+        conn.execute(
+            """INSERT INTO task_events(event_id,task_id,event_type,event_data_json,created_at)
+               VALUES (?,?,?,?,?)""",
+            (str(uuid4()), task_id, "dialogue_turn", _json(message), utc_now()),
+        )
