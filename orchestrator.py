@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """v0.6 workflow: independent provider/role selection, bounded retry, synthesis."""
 import fcntl
+from collections.abc import Callable
 import hashlib
 import json
 import time
@@ -47,6 +48,7 @@ def log_record(output, prompt):
         'duration_ms': output['duration_ms'],
         'prompt_hash': hashlib.sha256(prompt.encode()).hexdigest(),
         'answer_length': len(output['final_answer']),
+        'usage': output.get('usage', {}),
         'stages': [{**{k: s.get(k) for k in stage_keys},
                     'attempts': [{k: a.get(k) for k in attempt_keys} for a in s['attempts']]}
                    for s in output['stages']],
@@ -61,7 +63,27 @@ def save_log(record):
         f.flush()
 
 
-def run_orchestration(prompt, stages=None):
+def _sum_usage(items):
+    """Aggregate actual API token counts, never estimate Web token usage."""
+    counts = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
+    seen = False
+    for item in items:
+        if not isinstance(item, dict) or not item:
+            continue
+        for key in counts:
+            value = item.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counts[key] += value
+                seen = True
+    return counts if seen else {}
+
+
+def run_orchestration(prompt, stages=None, *, before_dispatch: Callable | None = None):
+    """Execute a sequence of stages. API stages are stateless and never retried.
+
+    before_dispatch is an optional durable, fail-closed intent recorder. It must
+    return successfully before a provider request can be sent.
+    """
     workflow = list(DEFAULT_WORKFLOW if stages is None else stages)
     if not prompt.strip() or '\x00' in prompt:
         raise ValueError('invalid prompt')
@@ -70,13 +92,22 @@ def run_orchestration(prompt, stages=None):
     for stage in workflow:
         if stage['provider'] not in PROVIDERS or stage['role'] not in ROLE_TEMPLATES:
             raise ValueError('unsupported provider or role')
+        if stage['provider'] == 'deepseek':
+            from deepseek_api import ALLOWED_MODELS
+            if stage.get('model', 'deepseek-flash') not in ALLOWED_MODELS:
+                raise ValueError('unsupported DeepSeek model')
+        elif stage.get('model') is not None:
+            raise ValueError('Web stages cannot specify an API model')
     started = time.monotonic()
     deadline = started + ROUTE_TIMEOUT_SECONDS
     route_id = str(uuid.uuid4())
     results = []
     for index, spec in enumerate(workflow):
         stage_started = time.monotonic()
-        stage = {**spec, 'success': False, 'status': 'failed', 'quality_ok': False,
+        transport = 'api' if spec['provider'] == 'deepseek' else 'web'
+        model = spec.get('model', 'deepseek-flash') if transport == 'api' else None
+        stage = {**spec, 'transport': transport, 'model': model,
+                 'success': False, 'status': 'failed', 'quality_ok': False,
                  'quality_reason': 'route_timeout', 'retry_count': 0,
                  'selected_attempt': None, 'attempts': [], 'answer': '', 'answer_length': 0}
         for attempt in (1, 2):
@@ -86,22 +117,38 @@ def run_orchestration(prompt, stages=None):
                 break
             name = f'orc-{route_id}-{index + 1}-{attempt}'
             stage_prompt = build_stage_prompt(spec['role'], prompt, results, retry=attempt == 2)
-            result = run_provider(spec['provider'], 'new', name, stage_prompt,
-                                  role=spec['role'], task=prompt, timeout=min(300, remaining))
+            if before_dispatch is not None:
+                before_dispatch(index=index + 1, attempt=attempt, provider=spec['provider'],
+                                transport=transport, model=model, role=spec['role'],
+                                conversation_name=name, prompt=stage_prompt)
+            kwargs = {'role': spec['role'], 'task': prompt, 'timeout': min(300, remaining)}
+            if transport == 'api':
+                kwargs.update(transport='api', model=model)
+            result = run_provider(spec['provider'], 'new', name, stage_prompt, **kwargs)
             stage['attempts'].append({
                 'attempt': attempt, 'conversation_name': name,
                 **{k: result[k] for k in ('transport_success', 'wrapper_success', 'quality_ok',
                                           'quality_reason', 'answer_length', 'duration_ms')},
                 'error_summary': result['error'],
+                'transport': transport, 'model': model,
+                'usage': result.get('usage', {}) if transport == 'api' else {},
+                'finish_reason': result.get('finish_reason', '') if transport == 'api' else '',
             })
             stage.update(quality_ok=result['quality_ok'], quality_reason=result['quality_reason'],
                          retry_count=attempt - 1)
             if result['success']:
                 stage.update(success=True, status='done', selected_attempt=attempt,
                              answer=result['answer'], answer_length=result['answer_length'],
-                             conversation_url=result['conversation_url'])
+                             conversation_url=result.get('conversation_url', ''))
+                break
+            # The API might have accepted a request even if our HTTP reply is
+            # missing. It must NEVER be retried. Custom workflows also refuse
+            # to replay an unconfirmed Web call.
+            if transport == 'api' or (before_dispatch is not None and
+                                      not result.get('transport_success', False)):
                 break
         stage['duration_ms'] = round((time.monotonic() - stage_started) * 1000)
+        stage['usage'] = _sum_usage(a.get('usage') for a in stage['attempts'])
         results.append(stage)
         if not stage['success']:
             break  # Failed text never enters another stage; no fallback.
@@ -111,6 +158,7 @@ def run_orchestration(prompt, stages=None):
         'timestamp': datetime.now(timezone.utc).isoformat(),
         'stages': results, 'final_answer': results[-1]['answer'] if success else '',
         'duration_ms': round((time.monotonic() - started) * 1000),
+        'usage': _sum_usage(s.get('usage') for s in results),
         'error': '' if success else f'{results[-1]["provider"]}/{results[-1]["role"]}: {results[-1]["quality_reason"]}',
     }
     try:

@@ -37,7 +37,7 @@ def _candidate(job_id):
         raise ResumeConflict("只允许从失败的 Dialogue 任务核对网页回答")
     root, rmeta = lineage[0]
     first, second = rmeta.get("first_provider"), rmeta.get("second_provider")
-    if {first, second} != {"gemini", "chatgpt"}:
+    if first == second or any(p not in {"gemini", "chatgpt", "deepseek"} for p in (first, second)):
         raise ResumeConflict("模型配置无效")
     turns = [t for tsk, _ in lineage for t in _read_turns(tsk["task_id"])]
     expected_index = len(turns) + 1
@@ -60,6 +60,8 @@ def _candidate(job_id):
     provider = (call["provider"] if call else intent.get("provider"))
     metadata = _unpack(call.get("metadata_json")) if call else {}
     name = metadata.get("conversation_name") or intent.get("conversation_name")
+    if provider == "deepseek":
+        raise ResumeConflict("DeepSeek API 结果未确认时不可通过网页恢复；禁止重新发送")
     if provider != expected_provider or provider not in CDP or not isinstance(name, str) or not name:
         raise ResumeConflict("待确认模型与对话轮次不匹配")
     if call and intent and (call["provider"] != intent.get("provider") or name != intent.get("conversation_name")):

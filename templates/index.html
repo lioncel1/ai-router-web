@@ -26,6 +26,7 @@
   <select id="provider">
     <option value="gemini">Gemini</option>
     <option value="chatgpt">ChatGPT</option>
+    <option value="deepseek">DeepSeek（API）</option>
     <option value="auto">Auto（分析 → 审查 → 综合）</option>
     <option value="dialogue">Dialogue（双模型对话）</option>
   </select>
@@ -51,17 +52,51 @@
     <div id="conversationHint" style="margin-top:6px;font-size:0.9em;opacity:0.75"></div>
   </div>
 
+  <!-- AI_ROUTER_V12_DEEPSEEK_SESSIONS -->
+  <div id="deepseekFields" class="hidden">
+    <label for="deepseekModel">DeepSeek API Model（模型）</label>
+    <select id="deepseekModel">
+      <option value="deepseek-flash">deepseek-flash</option>
+      <option value="deepseek-v4-pro">deepseek-v4-pro</option>
+    </select>
+    <p style="font-size:.9em;opacity:.75">API 会话保存在本机 SQLite，不关联官方网页；结果不明的会话禁止自动继续。</p>
+  </div>
+
+  <!-- AI_ROUTER_V12_AUTO_CONFIG -->
+  <div id="autoFields" class="hidden">
+    <p style="font-size:.9em;opacity:.75">Auto 三阶段模型可选，默认 Gemini → ChatGPT → ChatGPT。DeepSeek 使用独立 API 请求；Token 按 API 实际返回统计。</p>
+    <label for="autoAnalysis">① 分析模型</label>
+    <select id="autoAnalysis"><option value="gemini">Gemini Web</option><option value="chatgpt">ChatGPT Web</option><option value="deepseek">DeepSeek API（Auto）</option></select>
+    <label for="autoAnalysisModel">分析阶段 DeepSeek 型号（使用 DeepSeek 时生效）</label>
+    <select id="autoAnalysisModel"><option value="deepseek-flash">deepseek-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>
+    <label for="autoReview">② 审查模型</label>
+    <select id="autoReview"><option value="chatgpt">ChatGPT Web</option><option value="gemini">Gemini Web</option><option value="deepseek">DeepSeek API（Auto）</option></select>
+    <label for="autoReviewModel">审查阶段 DeepSeek 型号（使用 DeepSeek 时生效）</label>
+    <select id="autoReviewModel"><option value="deepseek-flash">deepseek-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>
+    <label for="autoSynthesis">③ 综合模型</label>
+    <select id="autoSynthesis"><option value="chatgpt">ChatGPT Web</option><option value="gemini">Gemini Web</option><option value="deepseek">DeepSeek API（Auto）</option></select>
+    <label for="autoSynthesisModel">综合阶段 DeepSeek 型号（使用 DeepSeek 时生效）</label>
+    <select id="autoSynthesisModel"><option value="deepseek-flash">deepseek-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select>
+  </div>
+
   <div id="dialogueFields" class="hidden">
     <label for="dialogueFirst">发问模型</label>
     <select id="dialogueFirst">
-      <option value="gemini">Gemini</option>
-      <option value="chatgpt">ChatGPT</option>
+      <option value="gemini">Gemini Web</option>
+      <option value="chatgpt">ChatGPT Web</option>
+      <option value="deepseek">DeepSeek API</option>
     </select>
 
     <label for="dialogueSecond">对话模型</label>
     <select id="dialogueSecond">
-      <option value="chatgpt">ChatGPT</option>
-      <option value="gemini">Gemini</option>
+      <option value="chatgpt">ChatGPT Web</option>
+      <option value="gemini">Gemini Web</option>
+      <option value="deepseek">DeepSeek API</option>
+    </select>
+    <label for="dialogueDeepseekModel">DeepSeek 模型（选择 DeepSeek 时生效）</label>
+    <select id="dialogueDeepseekModel">
+      <option value="deepseek-flash">deepseek-flash</option>
+      <option value="deepseek-v4-pro">deepseek-v4-pro</option>
     </select>
 
     <label for="dialogueCount">对话次数（按模型消息计数；双方一轮往返 = 2 次）</label>
@@ -198,6 +233,7 @@ async function openDialogueResume(jobId) {
     ));
     $('provider').value = 'dialogue';
     $('normalFields').classList.add('hidden');
+    $('autoFields').classList.add('hidden');
     $('dialogueFields').classList.remove('hidden');
     preparedDialogueJobId = jobId;
     $('dialogueResumeInfo').textContent =
@@ -250,6 +286,8 @@ $('provider').addEventListener('change', () => {
   const mode = $('provider').value;
   $('normalFields').classList.toggle('hidden', mode === 'auto' || mode === 'dialogue');
   $('dialogueFields').classList.toggle('hidden', mode !== 'dialogue');
+  $('autoFields').classList.toggle('hidden', mode !== 'auto');
+  $('deepseekFields').classList.toggle('hidden', mode !== 'deepseek');
 });
 
 $('send').addEventListener('click', async () => {
@@ -285,6 +323,7 @@ $('send').addEventListener('click', async () => {
           prompt,
           first_provider: firstProvider,
           second_provider: secondProvider,
+          deepseek_model: $('dialogueDeepseekModel').value,
           max_messages: maxMessages
         })
       }));
@@ -294,10 +333,21 @@ $('send').addEventListener('click', async () => {
     }
 
     if (provider === 'auto') {
+      const stages = [
+        ['analysis', 'autoAnalysis', 'autoAnalysisModel'],
+        ['review', 'autoReview', 'autoReviewModel'],
+        ['synthesis', 'autoSynthesis', 'autoSynthesisModel']
+      ].map(([role, providerId, modelId]) => {
+        const selected = $(providerId).value;
+        const stage = {role, provider: selected};
+        if (selected === 'deepseek') stage.model = $(modelId).value;
+        return stage;
+      });
+      const standard = stages.map(s => s.provider).join(',') === 'gemini,chatgpt,chatgpt';
       const startResponse = await fetch('/api/orchestrate/start', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({prompt})
+        body: JSON.stringify(standard ? {prompt} : {prompt, stages})
       });
 
       const startData = await readResponse(startResponse);
@@ -325,11 +375,12 @@ $('send').addEventListener('click', async () => {
       }
 
       const finalAnswer = data.final_answer || (data.success ? '无返回内容' : '编排失败，未生成最终答案');
-      const stages = data.stages || [];
+      const resultStages = data.stages || [];
 
       let stageHtml = '';
-      for (const stage of stages) {
-        stageHtml += `<details><summary>${esc(stage.provider)} / ${esc(stage.role)} · ${stage.success ? '完成' : '失败'} · ${esc(stage.duration_ms)} ms · 重试 ${esc(stage.retry_count)}</summary>${esc(stage.answer || stage.quality_reason || '')}</details>`;
+      for (const stage of resultStages) {
+        const token = stage.usage?.total_tokens;
+        stageHtml += `<details><summary>${esc(stage.provider)}${stage.model ? ` (${esc(stage.model)})` : ''} / ${esc(stage.role)} · ${stage.success ? '完成' : '失败'} · ${esc(stage.duration_ms)} ms · 重试 ${esc(stage.retry_count)}${token !== undefined ? ` · Token ${esc(token)}` : ''}</summary>${esc(stage.answer || stage.quality_reason || '')}</details>`;
       }
 
       result.innerHTML =
@@ -338,10 +389,32 @@ $('send').addEventListener('click', async () => {
         `<strong>Route：</strong>${esc(data.route_id)}<br>` +
         `<strong>是否成功：</strong>${data.success ? '是' : '否'}<br>` +
         `<strong>调用耗时：</strong>${esc(data.duration_ms)} ms` +
+        `${data.usage?.total_tokens !== undefined ? `<br><strong>DeepSeek Token 合计：</strong>${esc(data.usage.total_tokens)}` : ''}` +
         `${data.error ? `<br><strong>错误：</strong>${esc(data.error)}` : ''}` +
         `</div>` +
         stageHtml +
         `<hr><strong>最终答案：</strong><br>${esc(finalAnswer)}`;
+    } else if (provider === 'deepseek') {
+      const data = await readResponse(await fetch('/api/deepseek/session/chat', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({action: $('action').value, conversation_name: $('conversation').value,
+                              prompt, model: $('deepseekModel').value})
+      }));
+      result.innerHTML = `<div class="meta ${data.success ? 'ok' : 'bad'}">` +
+        `<strong>Provider：</strong>DeepSeek API<br>` +
+        `<strong>会话：</strong>${esc(data.conversation_name)}<br>` +
+        `<strong>模型：</strong>${esc(data.model)}<br>` +
+        `<strong>状态：</strong>${data.success ? '完成' : '失败/结果不确定'}<br>` +
+        `<strong>耗时：</strong>${esc(data.duration_ms)} ms<br>` +
+        `<strong>Token：</strong>${esc(data.usage?.total_tokens ?? '—')}` +
+        `${data.error ? `<br><strong>错误：</strong>${esc(data.error)}` : ''}` +
+        `</div><hr><strong>模型回复：</strong><br>${esc(data.answer || '无有效回答')}`;
+      if (data.success) {
+        $('conversation').value = data.conversation_name;
+        $('action').value = 'ask';
+        updateConversationUi();
+      }
+      await loadConversations();
     } else {
       const payload = {
         provider,
@@ -390,20 +463,22 @@ async function loadConversations() {
   if (provider === 'auto' || provider === 'dialogue') return;
 
   try {
-    const response = await fetch(`/api/conversations?provider=${encodeURIComponent(provider)}`);
+    const response = await fetch(provider === 'deepseek' ? '/api/deepseek/sessions' : `/api/conversations?provider=${encodeURIComponent(provider)}`);
     const data = await readResponse(response);
-    for (const item of data.conversations || []) {
-      const label = item.status === 'pending'
-        ? `${item.name} [pending，不可继续]`
+    for (const item of (provider === 'deepseek' ? data.sessions : data.conversations) || []) {
+      const blocked = provider === 'deepseek' ? item.status !== 'ready' : item.status === 'pending';
+      const label = blocked
+        ? `${item.name} [${item.status}，不可继续]`
         : `${item.name}${item.updated_at ? ' · ' + item.updated_at : ''}`;
 
       const option = document.createElement('option');
       option.value = item.name;
       option.textContent = label;
-      if (item.status === 'pending') option.disabled = true;
+      if (blocked) option.disabled = true;
+      if (provider === 'deepseek') option.dataset.model = item.model;
       list.appendChild(option);
 
-      if (item.status !== 'pending') {
+      if (!blocked) {
         const d = document.createElement('option');
         d.value = item.name;
         names.appendChild(d);
@@ -428,27 +503,34 @@ function updateConversationUi() {
   }
 
   tools.classList.remove('hidden');
+  $('importConversation').style.display = provider === 'deepseek' ? 'none' : '';
   $('conversationList').style.display = action === 'ask' ? '' : 'none';
   $('refreshConversations').style.display = action === 'ask' ? '' : 'none';
 
   if (action === 'ask') {
     $('conversation').placeholder = '从已有会话中选择，或填写会话名';
-    hint.textContent = '继续会话：优先从下拉列表选择。pending 会话不会允许直接继续。';
+    hint.textContent = provider === 'deepseek' ? 'API 多轮：选择 ready 会话；pending/uncertain 不会自动重发。' : '继续会话：优先从下拉列表选择。pending 会话不会允许直接继续。';
   } else {
     $('conversation').placeholder = '新名称；留空则自动生成';
-    hint.textContent = '新建会话：同一 Provider 内名称不可重复；Gemini 与 ChatGPT 可使用相同名称。';
+    hint.textContent = provider === 'deepseek' ? 'API 新会话：名称可留空，自动生成；仅保存已确认的上下文。' : '新建会话：同一 Provider 内名称不可重复；Gemini 与 ChatGPT 可使用相同名称。';
   }
 }
 
 $('conversationList').addEventListener('change', () => {
-  if ($('conversationList').value) $('conversation').value = $('conversationList').value;
+  if ($('conversationList').value) {
+    $('conversation').value = $('conversationList').value;
+    if ($('provider').value === 'deepseek') {
+      const item = $('conversationList').selectedOptions[0];
+      if (item?.dataset?.model) $('deepseekModel').value = item.dataset.model;
+    }
+  }
 });
 
 $('refreshConversations').addEventListener('click', loadConversations);
 
 $('importConversation').addEventListener('click', async () => {
   const provider = $('provider').value;
-  if (provider === 'auto' || provider === 'dialogue') return;
+  if (provider === 'auto' || provider === 'dialogue' || provider === 'deepseek') return;
 
   const name = window.prompt('给这个已有会话设置一个 Router 名称：');
   if (!name || !name.trim()) return;
@@ -481,6 +563,7 @@ $('importConversation').addEventListener('click', async () => {
 });
 
 $('provider').addEventListener('change', async () => {
+  $('conversation').value = '';
   updateConversationUi();
   await loadConversations();
 });

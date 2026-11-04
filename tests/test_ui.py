@@ -1,5 +1,5 @@
-import shutil
 """Browser UI regression tests using mocked HTTP responses; no provider calls."""
+import shutil
 import json
 import unittest
 from pathlib import Path

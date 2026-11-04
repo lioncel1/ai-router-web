@@ -1,5 +1,19 @@
 # AI Router Changelog
 
+## v1.2.0 — Web/API 混合协作
+
+### 新增
+- DeepSeek API 单轮聊天、多轮会话及网页端 Chat 选择。
+- Gemini / ChatGPT / DeepSeek 三模型任选两个参与 Dialogue。
+- Auto 分析、审查、综合三阶段模型自选，默认流程保持兼容。
+- DeepSeek API Token 使用量及 Web/API 通道记录。
+
+### 安全与限制
+- API 请求结果不确定时不自动重试；多轮 API 会话隔离为 uncertain。
+- Web 任务结果不确定时保留人工核对/安全恢复保护。
+- DeepSeek Flash 经真实调用验证；其他模型依赖实际账号可用性。
+- 未提供公网生产级安全保证，官方网页 DOM 更新可能导致 Web 通道失效。
+
 ## v1.1.0 — Dialogue 续聊和安全恢复
 
 ### 新增
