@@ -1,6 +1,6 @@
-import shutil
 """DOM fixtures exercise real Playwright selectors without model calls."""
 import unittest
+import shutil
 from unittest.mock import patch
 from playwright.sync_api import sync_playwright
 from web_response import snapshot, wait_for_answer
@@ -10,7 +10,7 @@ class DOMTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.p = sync_playwright().start()
-        cls.browser = cls.p.chromium.launch(executable_path=shutil.which("google-chrome") or shutil.which("chromium") or "/usr/bin/google-chrome", headless=True, args=['--disable-gpu'])
+        cls.browser = cls.p.chromium.launch(executable_path=shutil.which('google-chrome') or shutil.which('chromium') or '/usr/bin/google-chrome', headless=True, args=['--disable-gpu'])
         cls.page = cls.browser.new_page()
 
     @classmethod

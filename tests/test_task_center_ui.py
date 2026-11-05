@@ -1,7 +1,7 @@
-import shutil
 """Task Center UI regression with stubbed fetch. No live network, models or DB."""
 import json
 import unittest
+import shutil
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, expect
@@ -12,7 +12,7 @@ class TaskCenterUITests(unittest.TestCase):
     def setUpClass(cls):
         cls.p = sync_playwright().start()
         cls.browser = cls.p.chromium.launch(
-            executable_path=shutil.which("google-chrome") or shutil.which("chromium") or "/usr/bin/google-chrome",
+            executable_path=shutil.which('google-chrome') or shutil.which('chromium') or '/usr/bin/google-chrome',
             headless=True,
             args=['--disable-gpu'],
         )

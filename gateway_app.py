@@ -12,12 +12,17 @@ from typing import Literal
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from provider_runtime import run_provider
+from deepseek_api import is_configured
+from deepseek_task_service import execute as execute_deepseek_chat
+from deepseek_task_service import reconcile_interrupted_deepseek_tasks
+from deepseek_session_service import (execute_session, execute_dialogue_turn, list_sessions, read_session,
+    reconcile_interrupted_sessions, SessionConflict, SessionMissing)
 from orchestrator import run_orchestration
 from chat_task_service import execute_chat_with_task
-from auto_task_service import (create_auto_task, execute_auto_task,
+from auto_task_service import (create_auto_task, execute_auto_task, record_auto_dispatch_intent,
                                read_auto_job, reconcile_interrupted_auto_tasks)
 # AI_ROUTER_AUTO_TASK_V09_PHASE1
 
@@ -29,7 +34,7 @@ MAX_CONVERSATION_NAME_LENGTH = 80
 MAX_PROMPT_LENGTH = 100_000
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
-app = FastAPI(title="AI Router Gateway", version="0.6.0-rc")
+app = FastAPI(title="AI Router Gateway", version="1.2.0")
 
 
 class ChatRequest(BaseModel):
@@ -76,6 +81,85 @@ async def health() -> dict[str, str]:
     return {"status": "ok", "service": "ai-router-gateway"}
 
 
+# AI_ROUTER_V12_DEEPSEEK_SINGLE_TURN
+class DeepSeekChatRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    model: Literal["deepseek-flash", "deepseek-v4-pro"] = "deepseek-flash"
+
+    validate_prompt = field_validator("prompt")(ChatRequest.validate_prompt.__func__)
+
+
+@app.get("/api/deepseek/status")
+async def deepseek_status():
+    return {"provider": "deepseek", "transport": "api", "configured": is_configured(),
+            "models": ["deepseek-flash", "deepseek-v4-pro"],
+            "capability": "single_turn_only"}
+
+
+@app.on_event("startup")
+async def reconcile_deepseek_on_startup():
+    # Existing Web startup behavior is unchanged. Never issue a provider call.
+    await asyncio.to_thread(reconcile_interrupted_deepseek_tasks)
+
+
+@app.post("/api/deepseek/chat")
+async def deepseek_chat(request: DeepSeekChatRequest):
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="DeepSeek API key not configured; request not sent")
+    try:
+        return await asyncio.to_thread(execute_deepseek_chat, request.prompt, request.model)
+    except Exception:
+        # Never expose server environment/configuration or upstream HTTP headers.
+        raise HTTPException(status_code=503, detail="DeepSeek request status uncertain; check Task Center before any retry")
+
+
+# AI_ROUTER_V12_DEEPSEEK_SESSIONS
+class DeepSeekSessionChatRequest(BaseModel):
+    action: Literal["new", "ask"] = "new"
+    conversation_name: str = Field(default="", max_length=MAX_CONVERSATION_NAME_LENGTH)
+    prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    model: Literal["deepseek-flash", "deepseek-v4-pro"] = "deepseek-flash"
+
+    validate_conversation_name = field_validator("conversation_name")(ChatRequest.validate_conversation_name.__func__)
+    validate_prompt = field_validator("prompt")(ChatRequest.validate_prompt.__func__)
+
+
+@app.on_event("startup")
+async def reconcile_api_sessions_on_startup():
+    # Does not call any model. Old pending requests are quarantined on restart.
+    await asyncio.to_thread(reconcile_interrupted_sessions)
+
+
+@app.get("/api/deepseek/sessions")
+async def deepseek_sessions():
+    return {"sessions": await asyncio.to_thread(list_sessions)}
+
+
+@app.get("/api/deepseek/sessions/{session_name}")
+async def deepseek_session_detail(session_name: str):
+    try:
+        return await asyncio.to_thread(read_session, session_name)
+    except SessionMissing:
+        raise HTTPException(status_code=404, detail="DeepSeek session not found")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid DeepSeek session name")
+
+
+@app.post("/api/deepseek/session/chat")
+async def deepseek_session_chat(request: DeepSeekSessionChatRequest):
+    if not is_configured():
+        raise HTTPException(status_code=503, detail="DeepSeek API key not configured; request not sent")
+    try:
+        return await asyncio.to_thread(execute_session, request.prompt, request.action,
+                                       request.conversation_name, request.model)
+    except (SessionConflict, SessionMissing) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid DeepSeek session request; not sent")
+    except Exception:
+        raise HTTPException(status_code=503, detail="Session request status uncertain; inspect Task Center before retry")
+
+
 @app.post("/api/chat")
 async def chat(request: ChatRequest) -> dict:
     conversation_name = make_conversation_name(request.conversation_name)
@@ -110,20 +194,69 @@ async def chat(request: ChatRequest) -> dict:
     }
 
 
+AUTO_ROLES = ('analysis', 'review', 'synthesis')
+
+
+class AutoStageChoice(BaseModel):
+    provider: Literal['gemini', 'chatgpt', 'deepseek']
+    role: Literal['analysis', 'review', 'synthesis']
+    model: Literal['deepseek-flash', 'deepseek-v4-pro'] | None = None
+
+    @model_validator(mode='after')
+    def model_matches_provider(self):
+        if self.provider != 'deepseek' and self.model is not None:
+            raise ValueError('Web stage cannot specify DeepSeek model')
+        if self.provider == 'deepseek' and self.model is None:
+            self.model = 'deepseek-flash'
+        return self
+
+
 class OrchestrateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
+    stages: list[AutoStageChoice] | None = None
 
     validate_prompt = field_validator("prompt")(ChatRequest.validate_prompt.__func__)
+
+    @model_validator(mode='after')
+    def validate_stages(self):
+        if self.stages is not None and (
+            len(self.stages) != 3 or
+            tuple(stage.role for stage in self.stages) != AUTO_ROLES
+        ):
+            raise ValueError('Auto requires analysis, review, synthesis in that order')
+        return self
+
+
+def _auto_stages(req: OrchestrateRequest) -> list[dict] | None:
+    return [s.model_dump(exclude_none=True) for s in req.stages] if req.stages is not None else None
+
+
+def _auto_workflow(job_id: str, stages: list[dict] | None):
+    if stages is None:
+        return run_orchestration  # Preserve the legacy default's exact behavior.
+    from functools import partial
+    return partial(run_orchestration, stages=stages,
+                   before_dispatch=partial(record_auto_dispatch_intent, job_id))
+
+
+def _check_auto_provider_configuration(stages: list[dict] | None) -> None:
+    if stages and any(stage['provider'] == 'deepseek' for stage in stages) and not is_configured():
+        raise HTTPException(status_code=503, detail='DeepSeek API Key 未配置，未发送任何消息')
 
 
 @app.post("/api/orchestrate")
 async def orchestrate(req: OrchestrateRequest):
+    stages = _auto_stages(req)
+    _check_auto_provider_configuration(stages)
     job_id = str(uuid.uuid4())
     try:
-        await asyncio.to_thread(create_auto_task, req.prompt, job_id)
+        if stages is None:
+            await asyncio.to_thread(create_auto_task, req.prompt, job_id)
+        else:
+            await asyncio.to_thread(create_auto_task, req.prompt, job_id, stages=stages)
     except Exception:
         raise HTTPException(status_code=503, detail="Auto task storage unavailable; request not sent")
-    return await asyncio.to_thread(execute_auto_task, job_id, req.prompt, run_orchestration)
+    return await asyncio.to_thread(execute_auto_task, job_id, req.prompt, _auto_workflow(job_id, stages))
 
 
 # Browser-friendly async orchestration jobs. The existing /api/orchestrate
@@ -144,11 +277,11 @@ def _auto_task_startup_recovery():
         logging.getLogger(__name__).exception("Auto task startup recovery failed")
 
 
-def _run_orchestration_job(job_id: str, prompt: str) -> None:
+def _run_orchestration_job(job_id: str, prompt: str, stages: list[dict] | None = None) -> None:
     with ORCHESTRATION_JOBS_LOCK:
         ORCHESTRATION_JOBS[job_id] = {"status": "running"}
     try:
-        result = execute_auto_task(job_id, prompt, run_orchestration)
+        result = execute_auto_task(job_id, prompt, _auto_workflow(job_id, stages))
         status = "done" if result.get("success", True) else "failed"
         with ORCHESTRATION_JOBS_LOCK:
             ORCHESTRATION_JOBS[job_id] = {
@@ -166,15 +299,20 @@ def _run_orchestration_job(job_id: str, prompt: str) -> None:
 
 @app.post("/api/orchestrate/start")
 async def orchestrate_start(req: OrchestrateRequest):
+    stages = _auto_stages(req)
+    _check_auto_provider_configuration(stages)
     job_id = str(uuid.uuid4())
     try:
-        await asyncio.to_thread(create_auto_task, req.prompt, job_id)
+        if stages is None:
+            await asyncio.to_thread(create_auto_task, req.prompt, job_id)
+        else:
+            await asyncio.to_thread(create_auto_task, req.prompt, job_id, stages=stages)
     except Exception:
         raise HTTPException(status_code=503, detail="Auto task storage unavailable; request not sent")
     with ORCHESTRATION_JOBS_LOCK:
         ORCHESTRATION_JOBS[job_id] = {"status": "queued"}
     task = asyncio.create_task(
-        asyncio.to_thread(_run_orchestration_job, job_id, req.prompt)
+        asyncio.to_thread(_run_orchestration_job, job_id, req.prompt, stages)
     )
     ORCHESTRATION_TASKS.add(task)
     task.add_done_callback(ORCHESTRATION_TASKS.discard)
@@ -311,8 +449,9 @@ def _dialogue_task_startup_recovery():
 
 class DialogueRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=MAX_PROMPT_LENGTH)
-    first_provider: Literal["gemini", "chatgpt"]
-    second_provider: Literal["gemini", "chatgpt"]
+    first_provider: Literal["gemini", "chatgpt", "deepseek"]
+    second_provider: Literal["gemini", "chatgpt", "deepseek"]
+    deepseek_model: Literal["deepseek-flash", "deepseek-v4-pro"] = "deepseek-flash"
     max_messages: int = Field(default=6, ge=1, le=100)
 
     validate_prompt = field_validator("prompt")(ChatRequest.validate_prompt.__func__)
@@ -330,7 +469,10 @@ def _run_dialogue_job(
     prompt: str,
     max_messages: int,
     resume_context: dict | None = None,
+    deepseek_model: str = "deepseek-flash",
 ) -> None:
+    if resume_context:
+        deepseek_model = resume_context["deepseek_model"]
     # Keep original v0.7 routing: raw user prompt to A, then exact previous
     # model answer to the other provider. No hidden system or role injection.
     names = (dict(resume_context["conversation_names"]) if resume_context else {
@@ -392,7 +534,10 @@ def _run_dialogue_job(
             end("failed", error)
             return
         try:
-            result = run_provider(current, action, names[current], provider_prompt)
+            if current == "deepseek":
+                result = execute_dialogue_turn(provider_prompt, action, names[current], deepseek_model, job_id)
+            else:
+                result = run_provider(current, action, names[current], provider_prompt)
         except Exception as exc:
             error = f"{current} 调用异常：{type(exc).__name__}"
             try:
@@ -465,11 +610,13 @@ def _run_dialogue_job(
 async def dialogue_start(req: DialogueRequest):
     if req.first_provider == req.second_provider:
         raise HTTPException(status_code=400, detail="发问模型和对话模型不能相同")
+    if "deepseek" in {req.first_provider, req.second_provider} and not is_configured():
+        raise HTTPException(status_code=503, detail="DeepSeek API Key 未配置，未发送任何消息")
 
     job_id = str(uuid.uuid4())
     try:
         await asyncio.to_thread(_dts.create_dialogue_task, job_id, req.first_provider,
-                                req.second_provider, req.prompt, req.max_messages)
+                                req.second_provider, req.prompt, req.max_messages, req.deepseek_model)
     except Exception:
         raise HTTPException(status_code=503, detail="Dialogue task storage unavailable; request not sent")
     with DIALOGUE_JOBS_LOCK:
@@ -493,6 +640,7 @@ async def dialogue_start(req: DialogueRequest):
             req.second_provider,
             req.prompt,
             req.max_messages,
+            None, req.deepseek_model,
         )
     )
     DIALOGUE_TASKS.add(task)
@@ -517,12 +665,15 @@ async def dialogue_prepare(job_id: str):
     return {"success": True, **{
         k: preview[k] for k in ("source_job_id", "first_provider", "second_provider",
                              "next_provider", "last_provider", "default_prompt",
-                             "completed_messages", "next_action")}}
+                             "completed_messages", "next_action", "deepseek_model")}}
 
 
 @app.post("/api/dialogue/continue/{job_id}")
 async def dialogue_continue(job_id: str, req: DialogueContinueRequest):
     try:
+        check = await asyncio.to_thread(_dts.prepare_dialogue_continuation, job_id)
+        if "deepseek" in {check["first_provider"], check["second_provider"]} and not is_configured():
+            raise HTTPException(status_code=503, detail="DeepSeek API Key 未配置，未发送任何消息")
         detail = await asyncio.to_thread(
             _dts.create_dialogue_continuation, job_id, req.prompt, req.additional_messages
         )
@@ -546,7 +697,7 @@ async def dialogue_continue(job_id: str, req: DialogueContinueRequest):
         }
     task = asyncio.create_task(asyncio.to_thread(
         _run_dialogue_job, new_id, preview["first_provider"],
-        preview["second_provider"], req.prompt, req.additional_messages, preview
+        preview["second_provider"], req.prompt, req.additional_messages, preview, preview["deepseek_model"]
     ))
     DIALOGUE_TASKS.add(task)
     task.add_done_callback(DIALOGUE_TASKS.discard)

@@ -8,21 +8,36 @@ from pathlib import Path
 
 from quality import check_quality
 from provider_transport import dispatch_provider
+from provider_transport import TransportUnavailable
+import deepseek_api
 from router_log import ANSI_ESCAPE_RE, extract_answer, extract_conversation_url, is_valid_conversation_url
 
 BASE_DIR = Path(__file__).resolve().parent
-PROVIDERS = {'gemini', 'chatgpt'}
+PROVIDERS = {'gemini', 'chatgpt', 'deepseek'}
 
 
 # AI_ROUTER_V010_PHASE1_PROVIDER_DISPATCH
+# AI_ROUTER_V12_DEEPSEEK_SINGLE_TURN
 def run_provider(provider, action, conversation_name, prompt, *,
-                 role='answer', task=None, timeout=300, transport='web'):
-    """Preserve Web behavior; API fails closed until installed."""
+                 role='answer', task=None, timeout=300, transport='web', model=None, messages=None):
+    """Keep Web routing intact; enable one explicit DeepSeek API call."""
     if provider not in PROVIDERS or action not in {'new', 'ask'}:
         raise ValueError('unsupported provider or action')
+    api_call = None
+    if provider == 'deepseek':
+        # AI_ROUTER_V12_DEEPSEEK_SESSIONS
+        if transport != 'api' or (action == 'ask' and messages is None):
+            raise TransportUnavailable('DeepSeek single-turn API request only unless verified history; request not sent')
+        selected_model = model or 'deepseek-flash'
+        if selected_model not in deepseek_api.ALLOWED_MODELS:
+            raise ValueError('unsupported DeepSeek model')
+        def api_call(_provider, _action, _name, question, *, role, task, timeout):
+            if messages is None:
+                return deepseek_api.complete(question, model=selected_model, timeout=timeout)
+            return deepseek_api.complete(question, model=selected_model, timeout=timeout, messages=messages)
     return dispatch_provider(
         provider, action, conversation_name, prompt,
-        transport=transport, web_call=_run_web_provider,
+        transport=transport, web_call=_run_web_provider, api_call=api_call,
         role=role, task=task, timeout=timeout,
     )
 

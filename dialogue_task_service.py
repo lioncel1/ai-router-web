@@ -15,6 +15,7 @@ from conversation_store import load as load_conversations
 from typing import Any
 
 from database import connection, repository
+from deepseek_session_service import read_session, SessionMissing
 from task_manager import task_manager
 
 LOG = logging.getLogger(__name__)
@@ -31,15 +32,19 @@ def _ensure_schema() -> None:
 
 
 def create_dialogue_task(job_id: str, first: str, second: str,
-                         prompt: str, max_messages: int) -> str:
+                         prompt: str, max_messages: int, deepseek_model: str = "deepseek-flash") -> str:
     """Create the Task before scheduling any Web request; fail closed."""
     _ensure_schema()
+    if first == second or any(p not in {"gemini", "chatgpt", "deepseek"} for p in (first, second)):
+        raise ValueError("invalid dialogue provider pair")
+    if deepseek_model not in {"deepseek-flash", "deepseek-v4-pro"}:
+        raise ValueError("unsupported DeepSeek model")
     task_manager.create(
-        "dialogue", prompt, source="web", task_id=job_id,
+        "dialogue", prompt, source="mixed" if "deepseek" in {first, second} else "web", task_id=job_id,
         title=f"Dialogue: {first} → {second} ({max_messages} messages)",
         metadata={"workflow": "dialogue", "job_id": job_id,
                   "first_provider": first, "second_provider": second,
-                  "max_messages": max_messages},
+                  "max_messages": max_messages, "deepseek_model": deepseek_model},
     )
     try:
         repository.save_message(job_id, "user", prompt,
@@ -70,6 +75,7 @@ def record_dialogue_dispatch_intent(job_id: str, *, index: int, provider: str,
     import hashlib
     repository.save_task_event(job_id, "dialogue_dispatch_intent", event_data={
         "index": index, "provider": provider, "action": action,
+        "transport": "api" if provider == "deepseek" else "web",
         "conversation_name": conversation_name,
         "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     })
@@ -91,14 +97,19 @@ def record_dialogue_step(job_id: str, *, index: int, provider: str,
         "conversation_name": conversation_name,
         "conversation_url": result.get("conversation_url", ""),
     } if ok else None
+    transport = "api" if provider == "deepseek" else "web"
     repository.record_dialogue_step_atomic(
         job_id, provider=provider, action=action, status="done" if ok else "failed",
+        transport=transport,
         duration_ms=result.get("duration_ms"), input_length=len(prompt),
         output_length=result.get("answer_length", len(answer)),
         quality_ok=result.get("quality_ok"), quality_reason=result.get("quality_reason"),
         conversation_url=result.get("conversation_url") or None,
         error_message=(result.get("error") or None) if not ok else None,
         metadata={"dialogue_index": index, "conversation_name": conversation_name,
+                  "api_task_id": result.get("task_id") if transport == "api" else None,
+                  "model": result.get("model") if transport == "api" else None,
+                  "usage": result.get("usage", {}) if transport == "api" else {},
                   "transport_success": result.get("transport_success"),
                   "wrapper_success": result.get("wrapper_success")},
         message=message,
@@ -185,7 +196,7 @@ def _read_turns(job_id: str) -> list[dict[str, Any]]:
             item = json.loads(event["event_data_json"])
         except (TypeError, ValueError):
             continue
-        if isinstance(item, dict) and item.get("provider") in {"gemini", "chatgpt"} and isinstance(item.get("answer"), str):
+        if isinstance(item, dict) and item.get("provider") in {"gemini", "chatgpt", "deepseek"} and isinstance(item.get("answer"), str):
             turns.append(item)
     return turns
 
@@ -224,8 +235,11 @@ def prepare_dialogue_continuation(job_id: str) -> dict[str, Any]:
     root_task, root_meta = lineage[0]
     first = root_meta.get("first_provider")
     second = root_meta.get("second_provider")
-    if {first, second} != {"gemini", "chatgpt"}:
+    if first == second or any(p not in {"gemini", "chatgpt", "deepseek"} for p in (first, second)):
         raise ResumeConflict("Dialogue 模型配置无效")
+    model = root_meta.get("deepseek_model", "deepseek-flash")
+    if model not in {"deepseek-flash", "deepseek-v4-pro"}:
+        raise ResumeConflict("DeepSeek 模型配置无效")
     messages = []
     names = {}
     started = set()
@@ -251,6 +265,7 @@ def prepare_dialogue_continuation(job_id: str) -> dict[str, Any]:
     return {
         "source_job_id": job_id,
         "first_provider": first, "second_provider": second,
+        "deepseek_model": model,
         "next_provider": next_provider,
         "last_provider": last["provider"],
         "default_prompt": last["answer"],
@@ -271,6 +286,20 @@ def _verify_existing_conversation(preview: dict[str, Any]) -> None:
     """
     for provider in preview["started_providers"]:
         name = preview["conversation_names"][provider]
+        if provider == "deepseek":
+            try:
+                session = read_session(name)
+            except (SessionMissing, ValueError) as exc:
+                raise ResumeConflict("找不到原 DeepSeek API 会话，禁止重新发送") from exc
+            if session["session"]["status"] != "ready":
+                raise ResumeConflict("DeepSeek API 会话结果未确认，禁止继续或重发")
+            if session["session"]["model"] != preview["deepseek_model"]:
+                raise ResumeConflict("DeepSeek API 会话模型与原任务不一致")
+            confirmed = [m for m in preview["messages"] if m["provider"] == "deepseek"]
+            turns = session["messages"]
+            if len(turns) != 2 * len(confirmed) or not turns or turns[-1]["role"] != "assistant" or turns[-1]["content"] != confirmed[-1]["answer"]:
+                raise ResumeConflict("DeepSeek API 会话历史与 Dialogue 不一致，禁止继续")
+            continue
         path = Path(__file__).resolve().parent / "data" / f"{provider}_conversations.json"
         try:
             record = load_conversations(path).get(name)
@@ -299,13 +328,14 @@ def create_dialogue_continuation(parent_job_id: str, prompt: str,
     _ensure_schema()
     try:
         task_manager.create(
-            "dialogue", prompt, source="web", task_id=new_job_id,
+            "dialogue", prompt, source="mixed" if "deepseek" in {first, second} else "web", task_id=new_job_id,
             title=f"Dialogue 续聊: {first} → {second} (+{additional_messages})",
             metadata={"workflow": "dialogue", "job_id": new_job_id,
                       "first_provider": first, "second_provider": second,
                       "max_messages": additional_messages,
                       "parent_job_id": parent_job_id,
                       "root_job_id": preview["root_job_id"],
+                      "deepseek_model": preview["deepseek_model"],
                       "resume_prompt_edited": prompt != preview["default_prompt"]},
         )
     except Exception as exc:

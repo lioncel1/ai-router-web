@@ -1,26 +1,30 @@
-# AI Router · Web Edition
+# AI Router · Web/API Edition
 
-**v1.1.0 · Dialogue 安全续聊与断点恢复**
+**v1.2.0 · Gemini Web、ChatGPT Web、DeepSeek API 混合协作**
 
-个人自托管的 Gemini Web / ChatGPT Web 多模型协作工具，基于浏览器自动化（**非官方 API 客户端**）。发布的是源码快照，不承诺可以跨环境一键部署；使用前请核对平台服务条款、浏览器兼容性和认证安全。
+个人自托管的多模型对话与工作流工具：通过官方网页（浏览器自动化）访问 Gemini、ChatGPT，并通过独立 API Key 调用 DeepSeek。**不是上述平台的官方产品**；请遵守对应网站/API 的适用条款。当前发布的是在特定 Ubuntu 环境中验证过的**源码快照**，不是跨平台一键部署产品。
 
-## 已实现
+## 功能
 
-- **Chat**：Gemini / ChatGPT 单模型新建、继续会话、会话管理和官方 URL 导入。
-- **Auto**：Gemini 分析 → ChatGPT 审查 → ChatGPT 综合输出；异步任务及阶段结果。
-- **Dialogue**：Gemini / ChatGPT 多轮原样转发，配置发问顺序和消息条数；当前模型回答结束后安全停止。
-- **Dialogue 续聊**（v1.1）：从 `done` / `stopped` 任务继续，自动带入上条回答，**发送前可修改文本**；原任务不被改写，新任务保留关联。
-- **异常核对和恢复**（v1.1）：支持天气卡片等无复制按钮的富文本回答；记录发送意图，任务结果不确定时先从原网页**只读检查**，明确人工确认后保存恢复检查点；不自动重发。
-- **历史任务中心**：SQLite 保留 Chat、Auto、Dialogue 的任务、回答、调用及事件，重启后可查阅；已经恢复的任务可导航到最新续聊。
-- **预留 Web/API 分发接口**：`provider_transport.py` 提供显式通道分发，**API 适配器尚未接入**；当前业务仍只使用 Web。
+| 模式 | 能力 |
+| --- | --- |
+| **Chat** | Gemini / ChatGPT 网页会话新建、继续、导入；DeepSeek API 单轮及 SQLite 持久化多轮 Chat |
+| **Dialogue** | 从 Gemini Web、ChatGPT Web、DeepSeek API 中任选两个交替对话，设置先后、消息条数与 DeepSeek 模型 |
+| **Dialogue 续聊** | 已完成或安全停止后从上条回答继续，**发送前可编辑**；结果不明时不自动重试或猜测轮次 |
+| **Dialogue 异常恢复** | Gemini / ChatGPT 网页已生成但本地未登记的回答可以人工核对、确认后建立恢复检查点；不自动补发 |
+| **Auto** | 分析、审查、综合三阶段分别选 Gemini / ChatGPT / DeepSeek；默认仍为 Gemini → ChatGPT → ChatGPT |
+| **Task Center** | SQLite 记录任务、模型调用、消息、Web/API 通道及 DeepSeek 实际 Token 用量 |
 
-## 运行环境
+DeepSeek 代码目前允许 `deepseek-flash`、`deepseek-v4-pro`；实际接口支持及模型可用性取决于账户和服务商。**已进行真人 API 实测的是 `deepseek-flash`**。Token 数为 API 返回用量，**没有按价格计算或保证计费金额**。
 
-- 已验证的服务器环境：Ubuntu 24.04、Python 3.12、Chrome 及桌面会话。
-- 本项目 `*.sh` 和 `deploy/ai-router-gateway.service` 目前仍含 `/home/ubuntu/ai-router` 固定路径；若你使用其他用户/位置，请先检查并调整脚本路径。
-- 安装依赖不等于安装 Chrome；请自行安装 Chrome 并在图形桌面登录 Gemini 和 ChatGPT 官方网站。
+## 运行环境与部署限制
 
-### 最小部署示例（Ubuntu，默认路径）
+- 已验证的原服务器：Ubuntu 24.04、Python 3.12、Chrome、可用的图形桌面及持久登录态。
+- `start_*.sh`、`router_call.sh` 及 `deploy/ai-router-gateway.service` 当前有 **`/home/ubuntu/ai-router` 固定路径**；变更用户或安装目录前必须逐个核对并修改。
+- Gemini、ChatGPT Web 仍依赖官网 DOM，网站更新可能导致失效；此项目未提供官方 Gemini/OpenAI API 适配器。
+- **Gateway 和 Chrome CDP 只应绑定 `127.0.0.1`**。远程访问应自行部署 HTTPS、强认证和访问限制。单纯通过公网 HTTP + Basic Auth 不能视为生产安全。
+
+### 最小环境准备（Ubuntu，默认路径）
 
 ```bash
 cd /home/ubuntu
@@ -33,35 +37,56 @@ mkdir -p data logs profiles/gemini profiles/chatgpt
 .venv/bin/python -m database.connection
 ```
 
-在图形桌面中完成浏览器人工登录，之后按实际用户环境启动 `./start_gemini.sh` 与 `./start_chatgpt.sh`（Chrome CDP 默认仅本机 `9222`、`9223`）。在终端启动 Gateway：
+浏览器本身、图形桌面和账号人工登录需要另行准备。检查脚本中的 Chrome 路径后启动 `./start_gemini.sh` 和 `./start_chatgpt.sh`（CDP 通常为本机 `9222` 和 `9223`）。本机调试 Gateway：
 
 ```bash
 .venv/bin/uvicorn gateway_app:app --host 127.0.0.1 --port 8765
 ```
 
-在服务器本机打开 `http://127.0.0.1:8765`。**不能直接把 Gateway/CDP 端口暴露公网**；远程访问应通过 HTTPS + 身份验证 + 限制访问范围的反向代理。参考 `deploy/`，但该服务单元需按实际用户设置。
+打开服务器本机 `http://127.0.0.1:8765`。如要长期运行，可参考 `deploy/ai-router-gateway.service`，但需要自行完成 systemd 用户服务安装、Nginx/TLS/认证加固。
 
-## Dialogue：停止、继续、失败恢复
+### 配置 DeepSeek API Key
 
-- **正常继续**：网页选 Dialogue → 从最近任务继续，或任务中心选 `done` / `stopped` → 继续；默认填入上一条模型回答，修改后明确点击确认才发送。
-- **安全停止**：正在执行的模型允许完成当前回答，然后不再转发到另一模型；状态为 `stopped`。
-- **恢复失败对话**：任务中心选 `failed` → 核对原网页回答 → 逐字确认候选回答归属 → 建立 `stopped` 恢复检查点 → 从检查点继续。**预览及核对不会发送模型请求**；未知的网页请求结果不得重试。
-- **已恢复任务**：选中原失败任务会显示最新后续任务入口，避免重复建检查点。
+**不要将密钥写入代码、命令参数、Git、问题单或聊天记录。** 在服务器上以受限文件保存后，由用户级 systemd Gateway 加载。例如（以下为示意路径，不包含真实密钥）：
 
-详细操作和错误边界见 [`docs/DIALOGUE_RECOVERY.md`](docs/DIALOGUE_RECOVERY.md)。
+```bash
+mkdir -p -m 700 ~/.config/ai-router ~/.config/systemd/user/ai-router-gateway.service.d
+chmod 700 ~/.config/ai-router
+# 使用你信任的本地编辑方式创建 ~/.config/ai-router/deepseek.env
+# 文件内容格式：DEEPSEEK_API_KEY=<你的密钥>（不要提交此文件）
+chmod 600 ~/.config/ai-router/deepseek.env
+printf '[Service]\nEnvironmentFile=%%h/.config/ai-router/deepseek.env\n' > ~/.config/systemd/user/ai-router-gateway.service.d/deepseek.conf
+systemctl --user daemon-reload
+systemctl --user restart ai-router-gateway
+```
 
-## 自动化回归测试
+本机使用普通终端前台运行 Gateway 时，也必须在**仅当前服务进程可访问**的环境中提供 `DEEPSEEK_API_KEY`；不要在共享机器命令历史里输入密钥。未配置密钥时 DeepSeek API 请求会拒绝，不影响 Web 模式。
+
+`GET /api/deepseek/status` 用于检查配置是否加载（`configured`），**不验证密钥有效性**。单轮 `/api/deepseek/chat`、多轮 `/api/deepseek/session/chat` 会进行真实调用，可能产生费用。详见 [`docs/DEEPSEEK_API.md`](docs/DEEPSEEK_API.md)。
+
+## 续聊、安全停止与中断处理
+
+- Dialogue 停止请求在当前模型调用自然结束后生效，并不会撤回已经送出的网页/API 消息。
+- 常规续聊根据**已确认保存的最后一条回复**选择下一个模型，允许编辑待发送内容；原历史任务不改写。
+- **请求结果不确定时不能自动重发**。Web 回答可在原网页人工核对；API 多轮会话变为 `uncertain` 后禁止继续，当前没有自动解锁/人工确认 API 结果的功能。
+- Auto 自定义的 API 阶段不会重试；Web 请求结果不明时按安全边界终止。当前有重启/持久化保护，但不提供任意阶段自动断点续跑。
+
+详见 [`docs/DIALOGUE_RECOVERY.md`](docs/DIALOGUE_RECOVERY.md) 和 [`docs/DEEPSEEK_API.md`](docs/DEEPSEEK_API.md)。
+
+## 测试与发布范围
 
 ```bash
 .venv/bin/python -m pytest -q
 ```
 
-本版本基线在用户 Ubuntu 实际环境验证：**124 passed、5 subtests passed**（v1.1 RC1）；公开包经过源码精简和离线复核，实际发布前应再次运行完整测试。普通 `pytest` 只发现 `tests/`；`tests/smoke_*.py` 属于主动联网用例，**不要随意执行**。`install_phase3.py`、`install_v09_phase2.py` 和 `phase2_assets/` 为历史安装器兼容性测试保留，**不是新安装步骤，不要在 v1.1 上执行 `--apply`**。
+原开发服务器 v1.2 RC1（提交 `eeadfe8`）**173 passed、5 subtests passed**；已实测 DeepSeek Flash 的单轮、多轮 Chat，Gemini → DeepSeek Dialogue，以及 Gemini → DeepSeek → ChatGPT Auto。上述是该服务器环境的记录，不意味着每台机器都可无配置运行。浏览器 UI 自动化测试需要 Chrome/Chromium；公开包的浏览器回归测试优先寻找 PATH 中的 Chrome/Chromium；在隔离容器的模拟网页访问被管理策略阻断时，个别用例会标记为跳过。
 
-## 数据安全和授权
+`tests/smoke_*.py` 是手工联机测试脚本，不属于常规 pytest 测试；避免在未确认状态时重新发消息。`install_phase3.py`、`install_v09_phase2.py`、`install_v12_deepseek.py`、`install_v12_phase2.py` 与 `phase2_assets/` 仅为**旧版本测试依赖/兼容资料**，不要在已运行的 v1.2 上执行这些安装器的 `--apply`。
 
-请勿提交 `.env`、`data/`、`profiles/`、`logs/`、`debug/`、备份及会话链接。请求和模型回答可能含有敏感数据，备份也应限制访问。完整说明见 [`SECURITY.md`](SECURITY.md)。
+## 安全与授权
 
-**目前未选择开源许可证。** 仓库公开可见并不等于授予第三方复制/改造/商用权限。如果计划开源发布，请自行决定 `LICENSE`。
+- **绝不上传** `data/`、`profiles/`、`logs/`、`.env`、密钥、Cookie、个人会话 URL、数据库及备份。请查看 [`SECURITY.md`](SECURITY.md)。
+- 本仓库当前**没有 LICENSE**。源码公开可阅读不等于允许第三方自行再分发、改造或商用；若决定开源需明确选择许可证。
+- `docs/` 中有早期系统设计记录，不是全部功能已经实现的证明。
 
-变更信息见 [`CHANGELOG.md`](CHANGELOG.md)，发布说明见 [`RELEASE_NOTES_v1.1.0.md`](RELEASE_NOTES_v1.1.0.md)。部分 `docs/` 属于早期设计文档，非全部功能的已实现声明。
+发布历史见 [`CHANGELOG.md`](CHANGELOG.md) 和 [`RELEASE_NOTES_v1.2.0.md`](RELEASE_NOTES_v1.2.0.md)。

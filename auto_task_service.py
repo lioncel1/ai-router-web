@@ -6,6 +6,7 @@ Task ID == Auto job ID so existing /status/{job_id} URLs keep working.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -28,13 +29,14 @@ def _ensure_schema() -> None:
         connection.init_db()
 
 
-def create_auto_task(prompt: str, job_id: str) -> str:
+def create_auto_task(prompt: str, job_id: str, *, stages: list[dict] | None = None) -> str:
     """Persist the request BEFORE the background worker can send a prompt."""
     _ensure_schema()
     task_manager.create(
         "auto", prompt, task_id=job_id, source="web",
         title="Auto: analysis → review → synthesis",
-        metadata={"workflow": "auto_three_stage", "job_id": job_id},
+        metadata={"workflow": "auto_three_stage", "job_id": job_id,
+                  "stages": stages},
     )
     try:
         repository.save_message(job_id, "user", prompt, metadata={"workflow": "auto_three_stage"})
@@ -48,6 +50,18 @@ def create_auto_task(prompt: str, job_id: str) -> str:
     return job_id
 
 
+def record_auto_dispatch_intent(job_id: str, *, index: int, attempt: int,
+                                provider: str, transport: str, model: str | None,
+                                role: str, conversation_name: str, prompt: str) -> None:
+    """Persist an allowlisted pre-send checkpoint without storing prompt text."""
+    repository.save_task_event(job_id, 'auto_dispatch_intent', event_data={
+        'stage_index': index, 'attempt': attempt, 'provider': provider,
+        'transport': transport, 'model': model, 'role': role,
+        'conversation_name': conversation_name,
+        'prompt_sha256': hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+    })
+
+
 def _record_stages(job_id: str, result: dict[str, Any]) -> None:
     """Save completed stage evidence. This runs AFTER the orchestrator returns."""
     for index, stage in enumerate(result.get("stages") or [], start=1):
@@ -57,8 +71,9 @@ def _record_stages(job_id: str, result: dict[str, Any]) -> None:
         for attempt in stage.get("attempts") or []:
             selected = stage.get("selected_attempt") == attempt.get("attempt")
             ok = bool(attempt.get("quality_ok"))
+            transport = attempt.get('transport') or stage.get('transport') or ('api' if provider == 'deepseek' else 'web')
             repository.save_provider_call(
-                job_id, provider=provider, transport="web", action="new",
+                job_id, provider=provider, transport=transport, action="new",
                 status="done" if ok else "failed",
                 duration_ms=attempt.get("duration_ms"),
                 output_length=attempt.get("answer_length"),
@@ -71,12 +86,17 @@ def _record_stages(job_id: str, result: dict[str, Any]) -> None:
                     "selected": selected, "conversation_name": attempt.get("conversation_name"),
                     "transport_success": attempt.get("transport_success"),
                     "wrapper_success": attempt.get("wrapper_success"),
+                    "model": attempt.get('model') or stage.get('model'),
+                    "usage": attempt.get('usage') or {},
+                    "finish_reason": attempt.get('finish_reason', ''),
                 },
             )
         if stage.get("success") and answer.strip():
             repository.save_message(
-                job_id, "assistant", answer, provider=provider, transport="web",
+                job_id, "assistant", answer, provider=provider,
+                transport=stage.get('transport') or ('api' if provider == 'deepseek' else 'web'),
                 metadata={"stage_index": index, "role": role,
+                          "model": stage.get('model'), "usage": stage.get('usage') or {},
                           "conversation_url": stage.get("conversation_url") or ""},
             )
 

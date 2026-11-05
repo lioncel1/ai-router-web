@@ -404,12 +404,15 @@ def record_dialogue_step_atomic(
     quality_ok: bool | None, quality_reason: str | None,
     conversation_url: str | None, error_message: str | None,
     metadata: dict[str, Any], message: dict[str, Any] | None,
+    transport: str = "web",
 ) -> None:
     """Commit provider outcome + assistant turn + dialogue event in one transaction.
 
     A crash can leave a dispatch intent without an outcome, but never a
     visible Dialogue turn that lacks its recorded provider outcome.
     """
+    if transport not in {"web", "api"}:
+        raise ValueError("unsupported dialogue transport")
     if message is not None and (status != "done" or not message.get("answer", "").strip()):
         raise ValueError("message requires successful nonempty provider output")
     with _tx() as conn:
@@ -421,7 +424,7 @@ def record_dialogue_step_atomic(
                 output_length,quality_ok,quality_reason,conversation_url,error_message,
                 metadata_json)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (str(uuid4()), task_id, provider, "web", action, status, duration_ms,
+            (str(uuid4()), task_id, provider, transport, action, status, duration_ms,
              input_length, output_length, None if quality_ok is None else int(quality_ok),
              quality_reason, conversation_url, error_message, _json(metadata)),
         )
@@ -434,7 +437,7 @@ def record_dialogue_step_atomic(
             """INSERT INTO messages
                (message_id,task_id,role,provider,transport,content,sequence_no,created_at,metadata_json)
                VALUES (?,?,?,?,?,?,?,?,?)""",
-            (str(uuid4()), task_id, "assistant", provider, "web", message["answer"],
+            (str(uuid4()), task_id, "assistant", provider, transport, message["answer"],
              next_seq, utc_now(), _json({"dialogue_index": message["index"],
                                         "conversation_name": message["conversation_name"],
                                         "conversation_url": message.get("conversation_url", "")})),
